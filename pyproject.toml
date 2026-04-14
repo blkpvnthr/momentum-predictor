@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "momentum_predictor"
+version = "0.1.0"
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["momentum_predictor*"]
+exclude = ["outputs*", "scripts*"]

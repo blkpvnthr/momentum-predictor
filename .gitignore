@@ -1,0 +1,6 @@
+.env
+live/training_data.csv
+live/trading_model.zip
+live/vec_normalize.pkl
+live/regime_engine.pkl
+live/logs/

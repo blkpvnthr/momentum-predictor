@@ -1,0 +1,35 @@
+# Core data stack
+pandas
+numpy
+scipy
+
+# Machine learning
+scikit-learn
+stable-baselines3[extra]
+torch
+hmmlearn
+
+# RL environment
+gymnasium
+
+# Quantum (optional but used in your anomaly detection)
+qiskit
+
+# Alpaca live trading
+alpaca-py
+
+# API / dashboard
+fastapi
+uvicorn
+httpx
+
+# utilities
+python-dotenv
+tqdm
+rich
+pyyaml
+pytz
+
+# plotting / analysis
+matplotlib
+seaborn
