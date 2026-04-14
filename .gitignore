@@ -3,4 +3,10 @@ live/training_data.csv
 live/trading_model.zip
 live/vec_normalize.pkl
 live/regime_engine.pkl
-live/logs/
+live/logs/.venv/
+outputs/
+*.csv
+*.parquet
+__pycache__/
+.DS_Store
+.env
