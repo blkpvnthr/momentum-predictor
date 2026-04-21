@@ -11,3 +11,4 @@ __pycache__/
 .DS_Store
 .env
 live/logs/
+live/__pycache__/

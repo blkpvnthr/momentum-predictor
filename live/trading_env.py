@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections import deque
+from dataclasses import dataclass
+from typing import Optional
 
 import gymnasium as gym
 import numpy as np
@@ -8,140 +9,79 @@ import pandas as pd
 from gymnasium import spaces
 
 
+@dataclass
+class TradeCentricMDPConfig:
+    initial_cash: float = 100_000.0
+    hmax: int = 100
+    transaction_cost_pct: float = 0.001
+    invalid_action_penalty: float = 0.001
+    turbulence_threshold_quantile: float = 0.99
+    max_episode_steps: int = 256
+    allow_fractional_clip_to_cash: bool = True
+    reward_scale: float = 1.0
+    min_feature_lookback: int = 30
+    target_num_stocks: int = 30
+
+    # Trade-centric shaping
+    hold_winner_bonus_weight: float = 0.20
+    strong_trend_adx_threshold: float = 20.0
+    strong_trend_macd_floor: float = 0.0
+
+    loser_hold_penalty_weight: float = 0.15
+    loser_hold_threshold: float = 0.005
+
+    stagnation_penalty_weight: float = 0.002
+    stagnation_threshold: float = 0.002
+    stagnation_bars_threshold: int = 8
+
+    small_exit_penalty: float = 0.005
+    small_exit_threshold: float = 0.0075
+
+    premature_exit_penalty_weight: float = 0.75
+    premature_exit_lookahead: int = 5
+    premature_exit_min_future_gain: float = 0.0075
+
+    trade_reward_weight: float = 1.00
+    positive_trade_exponent: float = 1.25
+    negative_trade_linear_weight: float = 1.25
+
+    mfe_capture_bonus_weight: float = 0.90
+    min_bars_for_capture_bonus: int = 3
+    no_position_cash_idle_penalty: float = 0.0
+
+
 class TradingEnv(gym.Env):
-    """
-    Regime-directed trading environment.
-
-    Intended behavior:
-    - In BULL regimes, the agent may only enter long TQQQ.
-    - In BEAR regimes, the agent may only enter long SQQQ.
-    - QQQ is the signal anchor only. Its price action / derived features drive
-      entries, but QQQ itself is never traded.
-    - TQQQ and SQQQ prices are used for execution and PnL accounting.
-
-    Actions:
-        0 = HOLD
-        1 = ENTER_TQQQ
-        2 = EXIT_TQQQ
-        3 = ENTER_SQQQ
-        4 = EXIT_SQQQ
-    """
-
     metadata = {"render_modes": []}
 
-    SYMBOL_FLAT = 0
-    SYMBOL_TQQQ = 1
-    SYMBOL_SQQQ = 2
-
-    def __init__(
-        self,
-        data: pd.DataFrame,
-        min_hold_bars: int = 10,
-        transaction_cost: float = 0.0020,
-        slippage_cost: float = 0.0015,
-        churn_penalty: float = 0.0040,
-        invalid_action_penalty: float = 0.01,
-        regime_violation_penalty: float = 0.05,
-        low_confidence_entry_penalty: float = 0.01,
-        min_signal_confidence: float = 0.60,
-        flat_reward: float = 0.0002,
-        holding_penalty: float = 0.00005,
-        transition_holding_penalty: float = 0.0025,
-        tqqq_extra_penalty: float = 0.0010,
-        sma_gate_penalty: float = 0.01,
-        tqqq_bull_strength_threshold: float = 0.75,
-        sqqq_bear_strength_threshold: float = 0.75,
-        adx_threshold: float = 18.0,
-        max_episode_steps: int = 120,
-        rolling_sharpe_window: int = 20,
-        sharpe_weight: float = 0.10,
-        downside_penalty_weight: float = 0.15,
-        drawdown_penalty_weight: float = 0.15,
-    ):
+    def __init__(self, data: pd.DataFrame, config: Optional[TradeCentricMDPConfig] = None):
         super().__init__()
-
+        self.config = config or TradeCentricMDPConfig()
         self.data = data.reset_index(drop=True).copy()
 
-        self.min_hold_bars = int(min_hold_bars)
-        self.transaction_cost = float(transaction_cost)
-        self.slippage_cost = float(slippage_cost)
-        self.churn_penalty = float(churn_penalty)
-        self.invalid_action_penalty = float(invalid_action_penalty)
-        self.regime_violation_penalty = float(regime_violation_penalty)
-        self.low_confidence_entry_penalty = float(low_confidence_entry_penalty)
-        self.min_signal_confidence = float(min_signal_confidence)
-        self.flat_reward = float(flat_reward)
-        self.holding_penalty = float(holding_penalty)
-        self.transition_holding_penalty = float(transition_holding_penalty)
-        self.tqqq_extra_penalty = float(tqqq_extra_penalty)
-        self.sma_gate_penalty = float(sma_gate_penalty)
-        self.tqqq_bull_strength_threshold = float(tqqq_bull_strength_threshold)
-        self.sqqq_bear_strength_threshold = float(sqqq_bear_strength_threshold)
-        self.adx_threshold = float(adx_threshold)
+        self._discover_stock_universe()
+        self._build_indicator_matrices()
+        self._build_turbulence_index()
 
-        self.max_episode_steps = int(max_episode_steps)
-        self.rolling_sharpe_window = int(rolling_sharpe_window)
-        self.sharpe_weight = float(sharpe_weight)
-        self.downside_penalty_weight = float(downside_penalty_weight)
-        self.drawdown_penalty_weight = float(drawdown_penalty_weight)
+        if self.num_stocks == 0:
+            raise ValueError("No tradable stock close columns were found in the input dataframe.")
 
-        self.obs_cols = [
-            "pred_ret_5",
-            "pred_ret_15",
-            "pred_ret_30",
-            "breakout_prob",
-            "continuation_prob",
-            "signal_confidence",
-            "momentum_score",
-            "momentum_dispersion",
-            "momentum_agreement",
-            "price_vs_sma20",
-            "tema20_slope",
-            "adx",
-            "atr_pct",
-            "atr_expansion",
-            "mfi_14",
-            "bop",
-            "obv_slope",
-            "donchian_breakout",
-            "donchian_breakdown",
-            "donchian_width",
-            "donchian_distance_up",
-            "donchian_distance_down",
-            "regime_conf",
-            "bull_score",
-            "bear_score",
-            "transition_score",
-            "is_opening_window",
-            "is_midday",
-            "is_power_hour",
-            "hour",
-            "minute",
-            "sma_20",
-            "sma_50",
-            "sma20_slope",
-            "bull_cross_state",
-            "bear_cross_state",
-            "cross_up_event",
-            "cross_down_event",
+        self.extra_context_cols = [
+            c for c in self.data.columns
+            if c.startswith("universe_")
+            or c in {"regime_conf", "bull_score", "bear_score", "transition_score", "signal_confidence"}
         ]
 
-        required_cols = self.obs_cols + [
-            "regime",
-            "qqq_close",
-            "tqqq_close",
-            "sqqq_close",
-        ]
-        missing = [col for col in required_cols if col not in self.data.columns]
-        if missing:
-            raise ValueError(f"Environment data missing required columns: {missing}")
-
-        self.action_space = spaces.Discrete(5)
-        obs_dim = len(self.obs_cols) + 5
+        obs_dim = 1 + (6 * self.num_stocks) + len(self.extra_context_cols)
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
             shape=(obs_dim,),
+            dtype=np.float32,
+        )
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(self.num_stocks,),
             dtype=np.float32,
         )
 
@@ -149,232 +89,396 @@ class TradingEnv(gym.Env):
         self.idx = 0
         self.episode_step = 0
 
-        self.position_symbol = self.SYMBOL_FLAT
-        self.entry_price = 0.0
-        self.prev_mark_to_market = 0.0
-        self.unrealized_pnl = 0.0
-        self.steps_in_trade = 0
-        self.max_favorable_excursion = 0.0
-        self.current_drawdown = 0.0
+        self.balance = float(self.config.initial_cash)
+        self.holdings = np.zeros(self.num_stocks, dtype=np.int64)
+        self.prev_portfolio_value = float(self.config.initial_cash)
 
-        self.returns_window: deque[float] = deque(maxlen=self.rolling_sharpe_window)
+        self.avg_entry_price = np.zeros(self.num_stocks, dtype=np.float64)
+        self.trade_bars_held = np.zeros(self.num_stocks, dtype=np.int64)
+        self.trade_mfe = np.zeros(self.num_stocks, dtype=np.float64)
+        self.trade_active = np.zeros(self.num_stocks, dtype=bool)
+
+    def _discover_stock_universe(self) -> None:
+        close_cols = [c for c in self.data.columns if c.endswith("_close") and c not in {"close"}]
+        preferred_exclude = {"qqq_close"}
+        candidate_close_cols = [c for c in close_cols if c not in preferred_exclude]
+        candidate_close_cols = sorted(candidate_close_cols)
+
+        if self.config.target_num_stocks > 0:
+            candidate_close_cols = candidate_close_cols[: self.config.target_num_stocks]
+
+        self.stock_close_cols = candidate_close_cols
+        self.stock_symbols = [c[:-6].upper() for c in self.stock_close_cols]
+        self.stock_open_cols = [f"{s.lower()}_open" for s in self.stock_symbols]
+        self.stock_high_cols = [f"{s.lower()}_high" for s in self.stock_symbols]
+        self.stock_low_cols = [f"{s.lower()}_low" for s in self.stock_symbols]
+        self.stock_volume_cols = [f"{s.lower()}_volume" for s in self.stock_symbols]
+        self.num_stocks = len(self.stock_symbols)
+
+        missing_core = []
+        for col in self.stock_open_cols + self.stock_high_cols + self.stock_low_cols + self.stock_volume_cols:
+            if col not in self.data.columns:
+                missing_core.append(col)
+        if missing_core:
+            raise ValueError(
+                f"Input dataframe is missing OHLCV columns needed for multi-stock indicators: {missing_core[:20]}"
+            )
+
+    @staticmethod
+    def _ema(series: pd.Series, span: int) -> pd.Series:
+        return series.ewm(span=span, adjust=False).mean()
+
+    def _compute_macd(self, close: pd.Series) -> pd.Series:
+        ema12 = self._ema(close, 12)
+        ema26 = self._ema(close, 26)
+        macd_line = ema12 - ema26
+        signal = self._ema(macd_line, 9)
+        return (macd_line - signal).replace([np.inf, -np.inf], np.nan)
+
+    def _compute_rsi(self, close: pd.Series, window: int = 14) -> pd.Series:
+        delta = close.diff()
+        gain = delta.clip(lower=0).rolling(window).mean()
+        loss = (-delta.clip(upper=0)).rolling(window).mean()
+        rs = gain / (loss + 1e-8)
+        return (100.0 - (100.0 / (1.0 + rs))).replace([np.inf, -np.inf], np.nan)
+
+    def _compute_cci(self, high: pd.Series, low: pd.Series, close: pd.Series, window: int = 20) -> pd.Series:
+        tp = (high + low + close) / 3.0
+        sma_tp = tp.rolling(window).mean()
+        mad = (tp - sma_tp).abs().rolling(window).mean()
+        return ((tp - sma_tp) / (0.015 * (mad + 1e-8))).replace([np.inf, -np.inf], np.nan)
+
+    def _compute_adx(self, high: pd.Series, low: pd.Series, close: pd.Series, window: int = 14) -> pd.Series:
+        up_move = high.diff()
+        down_move = -low.diff()
+
+        plus_dm = pd.Series(np.where((up_move > down_move) & (up_move > 0), up_move, 0.0), index=high.index)
+        minus_dm = pd.Series(np.where((down_move > up_move) & (down_move > 0), down_move, 0.0), index=high.index)
+
+        prev_close = close.shift(1)
+        tr = pd.concat(
+            [
+                high - low,
+                (high - prev_close).abs(),
+                (low - prev_close).abs(),
+            ],
+            axis=1,
+        ).max(axis=1)
+
+        atr = tr.rolling(window).mean()
+        plus_di = 100.0 * plus_dm.rolling(window).mean() / (atr + 1e-8)
+        minus_di = 100.0 * minus_dm.rolling(window).mean() / (atr + 1e-8)
+        dx = 100.0 * ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-8))
+        return dx.rolling(window).mean().replace([np.inf, -np.inf], np.nan)
+
+    def _build_indicator_matrices(self) -> None:
+        prices, macd, rsi, cci, adx = [], [], [], [], []
+
+        for sym in self.stock_symbols:
+            close = self.data[f"{sym.lower()}_close"].astype(float)
+            high = self.data[f"{sym.lower()}_high"].astype(float)
+            low = self.data[f"{sym.lower()}_low"].astype(float)
+
+            prices.append(close.rename(sym))
+            macd.append(self._compute_macd(close).rename(sym))
+            rsi.append(self._compute_rsi(close).rename(sym))
+            cci.append(self._compute_cci(high, low, close).rename(sym))
+            adx.append(self._compute_adx(high, low, close).rename(sym))
+
+        self.price_matrix = pd.concat(prices, axis=1).ffill().bfill()
+        self.macd_matrix = pd.concat(macd, axis=1).fillna(0.0)
+        self.rsi_matrix = pd.concat(rsi, axis=1).fillna(50.0)
+        self.cci_matrix = pd.concat(cci, axis=1).fillna(0.0)
+        self.adx_matrix = pd.concat(adx, axis=1).fillna(0.0)
+
+        start_idx = max(self.config.min_feature_lookback, 30)
+        self.valid_start_idx = min(start_idx, max(len(self.data) - 2, 0))
+
+    def _build_turbulence_index(self) -> None:
+        returns = self.price_matrix.pct_change().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+        turbulence = np.zeros(len(self.data), dtype=float)
+        for i in range(len(self.data)):
+            if i < 60:
+                continue
+
+            hist = returns.iloc[max(0, i - 252):i]
+            if len(hist) < 20:
+                continue
+
+            cov = hist.cov().to_numpy()
+            try:
+                cov_inv = np.linalg.pinv(cov)
+            except Exception:
+                continue
+
+            y = returns.iloc[i].to_numpy()
+            mu = hist.mean().to_numpy()
+            diff = y - mu
+            turbulence[i] = float(diff.T @ cov_inv @ diff)
+
+        self.turbulence = pd.Series(turbulence, index=self.data.index)
+        self.turbulence_threshold = float(self.turbulence.quantile(self.config.turbulence_threshold_quantile))
 
     def _row(self) -> pd.Series:
         return self.data.iloc[self.idx]
 
-    def _signal_confidence(self) -> float:
-        return float(self._row()["signal_confidence"])
+    def _prices_t(self) -> np.ndarray:
+        return self.price_matrix.iloc[self.idx].to_numpy(dtype=np.float32)
 
-    def _is_flat(self) -> bool:
-        return self.position_symbol == self.SYMBOL_FLAT
+    def _prices_tp1(self) -> np.ndarray:
+        j = min(self.idx + 1, len(self.price_matrix) - 1)
+        return self.price_matrix.iloc[j].to_numpy(dtype=np.float32)
 
-    def _is_tqqq(self) -> bool:
-        return self.position_symbol == self.SYMBOL_TQQQ
+    def _macd_t(self) -> np.ndarray:
+        return self.macd_matrix.iloc[self.idx].to_numpy(dtype=np.float32)
 
-    def _is_sqqq(self) -> bool:
-        return self.position_symbol == self.SYMBOL_SQQQ
+    def _rsi_t(self) -> np.ndarray:
+        return self.rsi_matrix.iloc[self.idx].to_numpy(dtype=np.float32)
 
-    def _current_symbol_close(self) -> float:
-        row = self._row()
+    def _cci_t(self) -> np.ndarray:
+        return self.cci_matrix.iloc[self.idx].to_numpy(dtype=np.float32)
 
-        if self._is_tqqq():
-            return float(row["tqqq_close"])
-        if self._is_sqqq():
-            return float(row["sqqq_close"])
-        return float(row["qqq_close"])
+    def _adx_t(self) -> np.ndarray:
+        return self.adx_matrix.iloc[self.idx].to_numpy(dtype=np.float32)
 
-    def _entry_price_for_symbol(self, symbol_code: int) -> float:
-        row = self._row()
+    def _portfolio_value(self, prices: np.ndarray) -> float:
+        return float(self.balance + np.dot(prices, self.holdings))
 
-        if symbol_code == self.SYMBOL_TQQQ:
-            return float(row["tqqq_close"])
-        if symbol_code == self.SYMBOL_SQQQ:
-            return float(row["sqqq_close"])
-
-        raise ValueError(f"Unsupported symbol code: {symbol_code}")
-
-    def _mark_to_market(self, price: float) -> float:
-        if self._is_flat():
-            return 0.0
-        return (price - self.entry_price) / max(self.entry_price, 1e-8)
-
-    def _bull_sma_ok(self) -> bool:
-        row = self._row()
-        return bool(
-            (float(row["sma_20"]) > float(row["sma_50"]))
-            and (float(row["bull_cross_state"]) > 0.5)
-            and (float(row["price_vs_sma20"]) > 0.0)
-            and (float(row["sma20_slope"]) > 0.0)
-        )
-
-    def _bear_sma_ok(self) -> bool:
-        row = self._row()
-        return bool(
-            (float(row["sma_20"]) < float(row["sma_50"]))
-            and (float(row["bear_cross_state"]) > 0.5)
-            and (float(row["price_vs_sma20"]) < 0.0)
-            and (float(row["sma20_slope"]) < 0.0)
-        )
-
-    def _adx_ok(self) -> bool:
-        adx = float(self._row()["adx"])
-        return (not np.isnan(adx)) and (adx >= self.adx_threshold)
-
-    def _tqqq_allowed(self) -> bool:
-        row = self._row()
-        return bool(
-            str(row["regime"]) == "BULL"
-            and self._bull_sma_ok()
-            and float(row["bull_score"]) >= self.tqqq_bull_strength_threshold
-            and float(row["signal_confidence"]) >= self.min_signal_confidence
-            and self._adx_ok()
-        )
-
-    def _sqqq_allowed(self) -> bool:
-        row = self._row()
-        return bool(
-            str(row["regime"]) == "BEAR"
-            and self._bear_sma_ok()
-            and float(row["bear_score"]) >= self.sqqq_bear_strength_threshold
-            and float(row["signal_confidence"]) >= self.min_signal_confidence
-            and self._adx_ok()
-        )
-
-    def _allowed_actions(self) -> np.ndarray:
-        mask = np.zeros(5, dtype=bool)
-        mask[0] = True  # HOLD
-
-        if self._is_flat():
-            if self._tqqq_allowed():
-                mask[1] = True  # ENTER_TQQQ
-            if self._sqqq_allowed():
-                mask[3] = True  # ENTER_SQQQ
-
-        elif self._is_tqqq():
-            mask[2] = True  # EXIT_TQQQ
-
-        elif self._is_sqqq():
-            mask[4] = True  # EXIT_SQQQ
-
-        return mask
+    def _in_turbulence(self) -> bool:
+        return float(self.turbulence.iloc[self.idx]) > self.turbulence_threshold
 
     def _get_obs(self) -> np.ndarray:
-        row = self._row()
+        extras = [float(self._row()[c]) for c in self.extra_context_cols]
+        obs = np.concatenate(
+            [
+                np.array([self.balance], dtype=np.float32),
+                self._prices_t(),
+                self.holdings.astype(np.float32),
+                self._macd_t(),
+                self._rsi_t(),
+                self._cci_t(),
+                self._adx_t(),
+                np.asarray(extras, dtype=np.float32),
+            ]
+        )
+        return obs.astype(np.float32)
 
-        base_features = [float(row[col]) for col in self.obs_cols]
-        controlled_state = [
-            float(self.position_symbol == self.SYMBOL_TQQQ),
-            float(self.position_symbol == self.SYMBOL_SQQQ),
-            float(self.unrealized_pnl),
-            float(self.steps_in_trade),
-            float(self.current_drawdown),
-        ]
+    def _future_continuation_regret(self, stock_idx: int, exit_price: float) -> float:
+        horizon = self.config.premature_exit_lookahead
+        end_idx = min(self.idx + horizon, len(self.price_matrix) - 1)
+        if end_idx <= self.idx:
+            return 0.0
 
-        return np.asarray(base_features + controlled_state, dtype=np.float32)
+        future_prices = self.price_matrix.iloc[self.idx + 1:end_idx + 1, stock_idx].to_numpy(dtype=np.float64)
+        if future_prices.size == 0:
+            return 0.0
 
-    def _reset_trade_state(self) -> None:
-        self.position_symbol = self.SYMBOL_FLAT
-        self.entry_price = 0.0
-        self.prev_mark_to_market = 0.0
-        self.unrealized_pnl = 0.0
-        self.steps_in_trade = 0
-        self.max_favorable_excursion = 0.0
-        self.current_drawdown = 0.0
+        best_future = float(np.max(future_prices))
+        future_gain = (best_future - exit_price) / max(exit_price, 1e-8)
+        return max(0.0, future_gain)
 
-    def _enter_position(self, symbol_code: int) -> None:
-        self.position_symbol = symbol_code
-        self.entry_price = self._entry_price_for_symbol(symbol_code)
-        self.prev_mark_to_market = 0.0
-        self.unrealized_pnl = 0.0
-        self.steps_in_trade = 0
-        self.max_favorable_excursion = 0.0
-        self.current_drawdown = 0.0
+    def _trade_terminal_bonus(self, realized_return: float) -> float:
+        if realized_return > 0:
+            return self.config.trade_reward_weight * (realized_return ** self.config.positive_trade_exponent)
+        return -self.config.trade_reward_weight * (
+            abs(realized_return) * self.config.negative_trade_linear_weight
+        )
+
+    def _capture_bonus(self, realized_return: float, mfe: float, bars_held: int) -> float:
+        if bars_held < self.config.min_bars_for_capture_bonus or mfe <= 1e-8:
+            return 0.0
+        capture = np.clip(realized_return / mfe, 0.0, 1.0)
+        return self.config.mfe_capture_bonus_weight * capture
+
+    def _trade_exit_shaping(self, stock_idx: int, exit_price: float) -> float:
+        if not self.trade_active[stock_idx] or self.avg_entry_price[stock_idx] <= 0:
+            return 0.0
+
+        realized_return = (exit_price - self.avg_entry_price[stock_idx]) / max(self.avg_entry_price[stock_idx], 1e-8)
+        bars_held = int(self.trade_bars_held[stock_idx])
+        mfe = float(self.trade_mfe[stock_idx])
+
+        bonus = self._trade_terminal_bonus(realized_return)
+        bonus += self._capture_bonus(realized_return, mfe, bars_held)
+
+        if 0.0 < realized_return < self.config.small_exit_threshold:
+            bonus -= self.config.small_exit_penalty
+
+        regret = self._future_continuation_regret(stock_idx, exit_price)
+        if regret >= self.config.premature_exit_min_future_gain:
+            bonus -= self.config.premature_exit_penalty_weight * regret
+
+        return float(bonus)
+
+    def _clear_trade_tracking(self, stock_idx: int) -> None:
+        self.avg_entry_price[stock_idx] = 0.0
+        self.trade_bars_held[stock_idx] = 0
+        self.trade_mfe[stock_idx] = 0.0
+        self.trade_active[stock_idx] = False
+
+    def _mark_trade_state(self, prices_t: np.ndarray) -> None:
+        active_idx = np.where(self.holdings > 0)[0]
+        for i in active_idx:
+            if not self.trade_active[i]:
+                self.trade_active[i] = True
+                self.avg_entry_price[i] = float(prices_t[i])
+                self.trade_bars_held[i] = 0
+                self.trade_mfe[i] = 0.0
+            else:
+                self.trade_bars_held[i] += 1
+                rtn = (float(prices_t[i]) - self.avg_entry_price[i]) / max(self.avg_entry_price[i], 1e-8)
+                self.trade_mfe[i] = max(self.trade_mfe[i], rtn)
+
+    def _sell_all_due_to_turbulence(self, prices_t: np.ndarray) -> float:
+        if np.sum(self.holdings) <= 0:
+            return 0.0
+
+        reward_adjustment = 0.0
+        for i in range(self.num_stocks):
+            if self.holdings[i] > 0:
+                reward_adjustment += self._trade_exit_shaping(i, float(prices_t[i]))
+
+        sell_values = prices_t * self.holdings.astype(np.float32)
+        gross = float(np.sum(sell_values))
+        cost = gross * self.config.transaction_cost_pct
+
+        self.balance += gross - cost
+        self.holdings[:] = 0
+        reward_adjustment -= cost
+
+        for i in range(self.num_stocks):
+            self._clear_trade_tracking(i)
+
+        return reward_adjustment
+
+    def _apply_continuous_action(self, action: np.ndarray, prices_t: np.ndarray) -> float:
+        action = np.clip(action.astype(np.float32), -1.0, 1.0)
+
+        trade_qty = np.rint(np.abs(action) * self.config.hmax).astype(np.int64)
+        buy_mask = action > 0
+        sell_mask = action < 0
+
+        reward_adjustment = 0.0
+
+        if np.any(sell_mask):
+            desired_sell_qty = trade_qty * sell_mask.astype(np.int64)
+            sell_qty = np.minimum(desired_sell_qty, self.holdings)
+
+            for i in np.where(sell_qty > 0)[0]:
+                if sell_qty[i] >= self.holdings[i]:
+                    reward_adjustment += self._trade_exit_shaping(i, float(prices_t[i]))
+
+            sell_values = prices_t * sell_qty.astype(np.float32)
+            gross_sell = float(np.sum(sell_values))
+            sell_cost = gross_sell * self.config.transaction_cost_pct
+
+            self.holdings -= sell_qty
+            self.balance += gross_sell - sell_cost
+            reward_adjustment -= sell_cost
+
+            for i in np.where(self.holdings <= 0)[0]:
+                if self.trade_active[i]:
+                    self._clear_trade_tracking(i)
+
+        if np.any(buy_mask):
+            desired_buy_qty = trade_qty * buy_mask.astype(np.int64)
+            desired_buy_values = prices_t * desired_buy_qty.astype(np.float32)
+            desired_gross = float(np.sum(desired_buy_values))
+            desired_cost = desired_gross * self.config.transaction_cost_pct
+            desired_total = desired_gross + desired_cost
+
+            if desired_total <= self.balance + 1e-8:
+                buy_qty = desired_buy_qty
+            else:
+                if self.config.allow_fractional_clip_to_cash and desired_total > 0:
+                    scale = self.balance / desired_total
+                    buy_qty = np.floor(desired_buy_qty.astype(np.float32) * scale).astype(np.int64)
+                else:
+                    buy_qty = np.zeros_like(desired_buy_qty)
+
+            buy_values = prices_t * buy_qty.astype(np.float32)
+            gross_buy = float(np.sum(buy_values))
+            buy_cost = gross_buy * self.config.transaction_cost_pct
+            total_buy = gross_buy + buy_cost
+
+            if total_buy > self.balance + 1e-8:
+                reward_adjustment -= self.config.invalid_action_penalty
+            else:
+                new_idx = np.where((buy_qty > 0) & (self.holdings == 0))[0]
+                self.holdings += buy_qty
+                self.balance -= total_buy
+                reward_adjustment -= buy_cost
+                for i in new_idx:
+                    self.trade_active[i] = True
+                    self.avg_entry_price[i] = float(prices_t[i])
+                    self.trade_bars_held[i] = 0
+                    self.trade_mfe[i] = 0.0
+
+        if self.balance < -1e-6:
+            reward_adjustment -= self.config.invalid_action_penalty
+            self.balance = max(self.balance, 0.0)
+
+        return reward_adjustment
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
 
-        event_rows = self.data.index[
-            (self.data["donchian_breakout"] == 1.0)
-            | (self.data["donchian_breakdown"] == 1.0)
-            | (self.data["cross_up_event"] == 1.0)
-            | (self.data["cross_down_event"] == 1.0)
-        ].tolist()
-
-        if event_rows:
-            self.episode_start_idx = int(self.np_random.choice(event_rows))
-        else:
-            upper = max(len(self.data) - self.max_episode_steps - 1, 1)
-            self.episode_start_idx = int(self.np_random.integers(0, upper))
-
+        upper = max(len(self.data) - self.config.max_episode_steps - 1, self.valid_start_idx + 1)
+        self.episode_start_idx = int(self.np_random.integers(self.valid_start_idx, upper))
         self.idx = self.episode_start_idx
         self.episode_step = 0
-        self.returns_window.clear()
-        self._reset_trade_state()
 
-        return self._get_obs(), {"action_mask": self._allowed_actions()}
+        self.balance = float(self.config.initial_cash)
+        self.holdings = np.zeros(self.num_stocks, dtype=np.int64)
+        self.prev_portfolio_value = float(self.config.initial_cash)
 
-    def step(self, action: int):
-        action = int(action)
+        self.avg_entry_price = np.zeros(self.num_stocks, dtype=np.float64)
+        self.trade_bars_held = np.zeros(self.num_stocks, dtype=np.int64)
+        self.trade_mfe = np.zeros(self.num_stocks, dtype=np.float64)
+        self.trade_active = np.zeros(self.num_stocks, dtype=bool)
 
-        info: dict[str, object] = {}
+        return self._get_obs(), {
+            "stock_symbols": self.stock_symbols,
+            "turbulence_threshold": self.turbulence_threshold,
+        }
+
+    def step(self, action: np.ndarray):
+        action = np.asarray(action, dtype=np.float32)
+
         done = False
         truncated = False
         reward = 0.0
+        info: dict[str, object] = {}
 
-        current_row = self._row()
-        current_price = self._current_symbol_close()
-        regime = str(current_row["regime"])
-        signal_confidence = self._signal_confidence()
+        prices_t = self._prices_t()
+        self._mark_trade_state(prices_t)
+        value_t = self._portfolio_value(prices_t)
 
-        allowed = self._allowed_actions()
-        valid_action = bool(allowed[action])
+        if self._in_turbulence():
+            reward += self._sell_all_due_to_turbulence(prices_t)
+            action = np.zeros_like(action, dtype=np.float32)
+        else:
+            reward += self._apply_continuous_action(action, prices_t)
 
-        if not valid_action:
-            reward -= self.invalid_action_penalty
-            action = 0
+        active_idx = np.where(self.trade_active)[0]
+        for i in active_idx:
+            rtn = (float(prices_t[i]) - self.avg_entry_price[i]) / max(self.avg_entry_price[i], 1e-8)
+            macd_ok = float(self.macd_matrix.iloc[self.idx, i]) >= self.config.strong_trend_macd_floor
+            adx_ok = float(self.adx_matrix.iloc[self.idx, i]) >= self.config.strong_trend_adx_threshold
 
-        mtm_before = self._mark_to_market(current_price)
+            if rtn > 0 and macd_ok and adx_ok:
+                reward += self.config.hold_winner_bonus_weight * min(rtn, 0.05)
 
-        # Entry / exit logic
-        if action == 1 and self._is_flat():  # ENTER_TQQQ
-            if regime != "BULL":
-                reward -= self.regime_violation_penalty
-            if signal_confidence < self.min_signal_confidence:
-                reward -= self.low_confidence_entry_penalty
-            if not self._tqqq_allowed():
-                reward -= self.sma_gate_penalty
+            if rtn < -self.config.loser_hold_threshold:
+                reward -= self.config.loser_hold_penalty_weight * (abs(rtn) - self.config.loser_hold_threshold)
 
-            self._enter_position(self.SYMBOL_TQQQ)
-            reward -= self.transaction_cost + self.slippage_cost + self.tqqq_extra_penalty
+            if (
+                self.trade_bars_held[i] >= self.config.stagnation_bars_threshold
+                and abs(rtn) < self.config.stagnation_threshold
+            ):
+                reward -= self.config.stagnation_penalty_weight
 
-        elif action == 2 and self._is_tqqq():  # EXIT_TQQQ
-            realized = mtm_before
-            reward += realized
-            reward -= self.transaction_cost + self.slippage_cost
-            if self.steps_in_trade < self.min_hold_bars:
-                reward -= self.churn_penalty
-            self._reset_trade_state()
-
-        elif action == 3 and self._is_flat():  # ENTER_SQQQ
-            if regime != "BEAR":
-                reward -= self.regime_violation_penalty
-            if signal_confidence < self.min_signal_confidence:
-                reward -= self.low_confidence_entry_penalty
-            if not self._sqqq_allowed():
-                reward -= self.sma_gate_penalty
-
-            self._enter_position(self.SYMBOL_SQQQ)
-            reward -= self.transaction_cost + self.slippage_cost
-
-        elif action == 4 and self._is_sqqq():  # EXIT_SQQQ
-            realized = mtm_before
-            reward += realized
-            reward -= self.transaction_cost + self.slippage_cost
-            if self.steps_in_trade < self.min_hold_bars:
-                reward -= self.churn_penalty
-            self._reset_trade_state()
-
-        # Advance time
         self.idx += 1
         self.episode_step += 1
 
@@ -382,56 +486,27 @@ class TradingEnv(gym.Env):
             done = True
             self.idx = min(self.idx, len(self.data) - 1)
 
-        next_row = self._row()
-        next_price = self._current_symbol_close()
+        prices_tp1 = self._prices_tp1()
+        value_tp1 = self._portfolio_value(prices_tp1)
 
-        mtm_after = self._mark_to_market(next_price)
-        pnl_delta = mtm_after - self.prev_mark_to_market
+        step_portfolio_change = value_tp1 - value_t
+        reward += step_portfolio_change * self.config.reward_scale
 
-        # Reward shaping
-        if not self._is_flat():
-            self.steps_in_trade += 1
-            self.unrealized_pnl = mtm_after
-            self.max_favorable_excursion = max(self.max_favorable_excursion, mtm_after)
-            self.current_drawdown = self.max_favorable_excursion - mtm_after
+        if np.sum(self.holdings) == 0 and self.config.no_position_cash_idle_penalty > 0:
+            reward -= self.config.no_position_cash_idle_penalty
 
-            reward += pnl_delta
-            reward -= self.holding_penalty
-
-            self.returns_window.append(pnl_delta)
-            returns_arr = np.asarray(self.returns_window, dtype=np.float32)
-
-            if len(returns_arr) >= 5:
-                mean_r = float(np.mean(returns_arr))
-                std_r = float(np.std(returns_arr)) + 1e-8
-                rolling_sharpe = mean_r / std_r
-
-                downside = returns_arr[returns_arr < 0]
-                downside_std = float(np.std(downside)) if len(downside) > 0 else 0.0
-
-                reward += self.sharpe_weight * rolling_sharpe
-                reward -= self.downside_penalty_weight * downside_std
-                reward -= self.drawdown_penalty_weight * self.current_drawdown
-        else:
-            self.unrealized_pnl = 0.0
-            self.steps_in_trade = 0
-            self.max_favorable_excursion = 0.0
-            self.current_drawdown = 0.0
-            self.returns_window.append(0.0)
-            reward += self.flat_reward
-
-        self.prev_mark_to_market = mtm_after
-
-        if not self._is_flat() and str(next_row["regime"]) == "TRANSITION":
-            reward -= self.transition_holding_penalty
-
-        if self.episode_step >= self.max_episode_steps:
+        if self.episode_step >= self.config.max_episode_steps:
             truncated = True
 
-        info["action_mask"] = self._allowed_actions()
-        info["position_symbol"] = self.position_symbol
-        info["unrealized_pnl"] = self.unrealized_pnl
-        info["regime"] = str(next_row["regime"])
-        info["signal_confidence"] = float(next_row["signal_confidence"])
+        self.prev_portfolio_value = value_tp1
+
+        info["portfolio_value"] = float(value_tp1)
+        info["balance"] = float(self.balance)
+        info["holdings"] = self.holdings.copy()
+        info["prices"] = prices_tp1.copy()
+        info["step_portfolio_change"] = float(step_portfolio_change)
+        info["turbulence"] = float(self.turbulence.iloc[self.idx])
+        info["turbulence_threshold"] = float(self.turbulence_threshold)
+        info["stock_symbols"] = self.stock_symbols
 
         return self._get_obs(), float(reward), done, truncated, info

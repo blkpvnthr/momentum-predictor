@@ -1,0 +1,1 @@
+['INTC', 'IBIT', 'SQQQ', 'CMCSA', 'PYPL', 'BND', 'WBD', 'CSX', 'NVD', 'MDLZ', 'SOFI', 'PLTD', 'FITB', 'IREN', 'ETHA', 'SMCI', 'TSLL', 'BKR', 'EXC', 'HBAN', 'AAL', 'TEAM', 'WULF', 'DKNG', 'TTD', 'TSLG', 'FAST', 'TSDD', 'CPRT', 'KHC']

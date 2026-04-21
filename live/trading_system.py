@@ -10,7 +10,7 @@ from sklearn.preprocessing import StandardScaler
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
-from trading_env import TradingEnv
+from trading_env import TradeCentricMDPConfig, TradingEnv
 
 try:
     from hmmlearn.hmm import GaussianHMM
@@ -27,9 +27,6 @@ VECNORM_PATH = LIVE_DIR / "vec_normalize.pkl"
 REGIME_ENGINE_PATH = LIVE_DIR / "regime_engine.pkl"
 
 
-# =========================================================
-# REGIME ENGINE
-# =========================================================
 @dataclass
 class HMMRegimeConfig:
     n_states: int = 3
@@ -43,11 +40,6 @@ class HMMRegimeConfig:
 
 
 class HMMRegimeEngine:
-    """
-    Fits a Gaussian HMM to QQQ-derived market state features and maps hidden
-    states to BULL / BEAR / TRANSITION.
-    """
-
     def __init__(self, config: HMMRegimeConfig | None = None):
         self.config = config or HMMRegimeConfig()
         self.model: GaussianHMM | None = None
@@ -61,14 +53,12 @@ class HMMRegimeEngine:
             raise RuntimeError("hmmlearn is not available. Install it to use the HMM regime engine.")
 
         self.feature_cols = list(feature_cols)
-
         x = (
             df[self.feature_cols]
             .replace([np.inf, -np.inf], np.nan)
             .dropna()
             .to_numpy(dtype=float)
         )
-
         if len(x) < 200:
             raise RuntimeError("Not enough rows to fit HMM regime engine.")
 
@@ -85,23 +75,15 @@ class HMMRegimeEngine:
         self.model.fit(x_scaled)
 
         hidden = self.model.predict(x_scaled)
-
         temp = pd.DataFrame(x, columns=self.feature_cols)
         temp["state"] = hidden
 
-        if "ret_1" in temp.columns:
-            ret_col = "ret_1"
-        elif "ret_5" in temp.columns:
-            ret_col = "ret_5"
-        else:
-            ret_col = self.feature_cols[0]
-
+        ret_col = "ret_1" if "ret_1" in temp.columns else ("ret_5" if "ret_5" in temp.columns else self.feature_cols[0])
         agg_map: dict[str, tuple[str, str]] = {
             "mean_ret": (ret_col, "mean"),
             "vol": ("atr_pct", "mean") if "atr_pct" in temp.columns else (ret_col, "std"),
             "adx_mean": ("adx", "mean") if "adx" in temp.columns else (ret_col, "mean"),
         }
-
         state_summary = temp.groupby("state").agg(**agg_map).reset_index()
 
         bull_state = int(state_summary.sort_values("mean_ret", ascending=False).iloc[0]["state"])
@@ -125,23 +107,19 @@ class HMMRegimeEngine:
             raise RuntimeError("HMMRegimeEngine must be fitted before predict().")
 
         temp = df.copy()
-
         x = (
             temp[self.feature_cols]
             .replace([np.inf, -np.inf], np.nan)
             .fillna(0.0)
             .to_numpy(dtype=float)
         )
-
         x_scaled = self.scaler.transform(x) if self.scaler is not None else x
-
         hidden = self.model.predict(x_scaled)
         probs = self.model.predict_proba(x_scaled)
 
         temp["hmm_state"] = hidden
         temp["regime"] = [self.state_to_regime.get(int(s), "TRANSITION") for s in hidden]
         temp["regime_conf"] = probs.max(axis=1).astype(np.float32)
-
         temp["bull_score"] = 0.0
         temp["bear_score"] = 0.0
         temp["transition_score"] = 0.0
@@ -150,7 +128,6 @@ class HMMRegimeEngine:
             regime = self.state_to_regime.get(int(state), "TRANSITION")
             confidence = float(probs[i].max())
             idx = temp.index[i]
-
             if regime == "BULL":
                 temp.at[idx, "bull_score"] = confidence
             elif regime == "BEAR":
@@ -186,9 +163,6 @@ class HMMRegimeEngine:
         return obj
 
 
-# =========================================================
-# FEATURE ENGINEERING
-# =========================================================
 def _safe_div(a: pd.Series, b: pd.Series, eps: float = 1e-8) -> pd.Series:
     return a / (b + eps)
 
@@ -229,18 +203,78 @@ def _compute_adx(df: pd.DataFrame, window: int = 14) -> tuple[pd.Series, pd.Seri
     return adx, plus_di, minus_di
 
 
+def _build_universe_context(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    close_cols = [c for c in df.columns if c.endswith("_close") and c not in {"close"}]
+    volume_cols = [c for c in df.columns if c.endswith("_volume") and c not in {"volume"}]
+
+    if not close_cols:
+        return df
+
+    close_df = df[close_cols].astype(float).replace([np.inf, -np.inf], np.nan)
+    volume_df = df[volume_cols].astype(float).replace([np.inf, -np.inf], np.nan) if volume_cols else pd.DataFrame(index=df.index)
+
+    ret_1 = close_df.pct_change(1)
+    ret_5 = close_df.pct_change(5)
+    ret_15 = close_df.pct_change(15)
+
+    sma20 = close_df.rolling(20, min_periods=5).mean()
+    above_sma20 = (close_df > sma20).astype(float)
+
+    vol_ma20 = volume_df.rolling(20, min_periods=5).mean() if not volume_df.empty else pd.DataFrame(index=df.index)
+    vol_ratio = (volume_df / vol_ma20.replace(0.0, np.nan)) if not volume_df.empty else pd.DataFrame(index=df.index)
+
+    top_k = max(1, int(np.ceil(close_df.shape[1] * 0.10)))
+
+    universe = pd.DataFrame(index=df.index)
+    universe["universe_ret_mean_1m"] = ret_1.mean(axis=1).fillna(0.0)
+    universe["universe_ret_mean_5m"] = ret_5.mean(axis=1).fillna(0.0)
+    universe["universe_ret_mean_15m"] = ret_15.mean(axis=1).fillna(0.0)
+
+    universe["universe_breadth_up_1m"] = (ret_1 > 0).mean(axis=1).fillna(0.5)
+    universe["universe_breadth_up_5m"] = (ret_5 > 0).mean(axis=1).fillna(0.5)
+    universe["universe_breadth_up_15m"] = (ret_15 > 0).mean(axis=1).fillna(0.5)
+
+    universe["universe_breadth_down_5m"] = (ret_5 < 0).mean(axis=1).fillna(0.5)
+    universe["universe_trend_breadth"] = above_sma20.mean(axis=1).fillna(0.5)
+
+    universe["universe_dispersion_1m"] = ret_1.std(axis=1).fillna(0.0)
+    universe["universe_dispersion_5m"] = ret_5.std(axis=1).fillna(0.0)
+    universe["universe_dispersion_15m"] = ret_15.std(axis=1).fillna(0.0)
+
+    def _row_top_mean(row: pd.Series) -> float:
+        vals = np.sort(row.dropna().values)
+        return 0.0 if len(vals) == 0 else float(np.nanmean(vals[-top_k:]))
+
+    def _row_bottom_mean(row: pd.Series) -> float:
+        vals = np.sort(row.dropna().values)
+        return 0.0 if len(vals) == 0 else float(np.nanmean(vals[:top_k]))
+
+    universe["universe_leadership_score"] = ret_5.apply(_row_top_mean, axis=1).fillna(0.0)
+    universe["universe_laggard_score"] = ret_5.apply(_row_bottom_mean, axis=1).fillna(0.0)
+    universe["universe_leader_minus_laggard"] = (
+        universe["universe_leadership_score"] - universe["universe_laggard_score"]
+    ).fillna(0.0)
+
+    if not vol_ratio.empty:
+        universe["universe_volume_pressure"] = (
+            vol_ratio.clip(lower=0.0, upper=5.0).mean(axis=1) - 1.0
+        ).fillna(0.0)
+        universe["universe_volume_breadth"] = (vol_ratio > 1.1).mean(axis=1).fillna(0.0)
+    else:
+        universe["universe_volume_pressure"] = 0.0
+        universe["universe_volume_breadth"] = 0.0
+
+    universe = universe.replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    return pd.concat([df, universe], axis=1)
+
+
 def build_features(
     df: pd.DataFrame,
     regime_engine: HMMRegimeEngine | None = None,
     fit_regime_engine: bool = False,
 ) -> tuple[pd.DataFrame, HMMRegimeEngine | None]:
-    """
-    Build QQQ-driven features.
-
-    Expected minimum input:
-    - timestamp, open, high, low, close, volume   (QQQ bar data)
-    - tqqq_close, sqqq_close                      (execution prices)
-    """
     df = df.copy()
 
     required = ["timestamp", "open", "high", "low", "close", "volume", "tqqq_close", "sqqq_close"]
@@ -445,35 +479,18 @@ def build_features(
         df["transition_score"] = np.where(df["regime"] == "TRANSITION", 1.0 - df["regime_conf"], 0.0)
 
     df["trading_enabled"] = (df["regime"] != "TRANSITION").astype(np.float32)
+    df = _build_universe_context(df)
 
     feature_cols_to_clean = [
-        "pred_ret_5",
-        "pred_ret_15",
-        "pred_ret_30",
-        "momentum_score",
-        "momentum_dispersion",
-        "momentum_agreement",
-        "price_vs_sma20",
-        "sma20_slope",
-        "tema20_slope",
-        "atr_pct",
-        "atr_expansion",
-        "adx",
-        "obv_slope",
-        "mfi_14",
-        "bop",
-        "donchian_width",
-        "donchian_distance_up",
-        "donchian_distance_down",
-        "signal_confidence",
-        "regime_conf",
-        "bull_score",
-        "bear_score",
-        "transition_score",
-        "tqqq_close",
-        "sqqq_close",
-        "qqq_close",
-    ]
+        "pred_ret_5", "pred_ret_15", "pred_ret_30",
+        "momentum_score", "momentum_dispersion", "momentum_agreement",
+        "price_vs_sma20", "sma20_slope", "tema20_slope",
+        "atr_pct", "atr_expansion", "adx",
+        "obv_slope", "mfi_14", "bop",
+        "donchian_width", "donchian_distance_up", "donchian_distance_down",
+        "signal_confidence", "regime_conf", "bull_score", "bear_score", "transition_score",
+        "tqqq_close", "sqqq_close", "qqq_close",
+    ] + [c for c in df.columns if c.startswith("universe_")]
 
     for col in feature_cols_to_clean:
         if col in df.columns:
@@ -485,33 +502,19 @@ def build_features(
     for col in ["qqq_close", "tqqq_close", "sqqq_close", "bull_cross_state", "bear_cross_state"]:
         print(f"  {col}: {'yes' if col in df.columns else 'no'}")
 
+    universe_close_cols = [c for c in df.columns if c.endswith("_close") and c not in {"close"}]
+    print(f"[features] retained universe close columns: {len(universe_close_cols)}")
+    print(f"[features] retained universe context columns: {len([c for c in df.columns if c.startswith('universe_')])}")
+
     return df, regime_engine
 
 
-# =========================================================
-# LIVE TRADER
-# =========================================================
 class LiveTrader:
-    """
-    Action map must match TradingEnv:
-
-        0 = HOLD
-        1 = ENTER_TQQQ
-        2 = EXIT_TQQQ
-        3 = ENTER_SQQQ
-        4 = EXIT_SQQQ
-    """
-
-    SYMBOL_FLAT = 0
-    SYMBOL_TQQQ = 1
-    SYMBOL_SQQQ = 2
-
     def __init__(
         self,
         model_path: str | Path = MODEL_PATH,
         vecnorm_path: str | Path = VECNORM_PATH,
         regime_engine_path: str | Path = REGIME_ENGINE_PATH,
-        transition_entry_confidence: float = 0.85,
     ):
         self.model = PPO.load(str(model_path))
         self.vec_norm_path = Path(vecnorm_path)
@@ -523,72 +526,54 @@ class LiveTrader:
             else None
         )
 
-        self.transition_entry_confidence = float(transition_entry_confidence)
-
-        self.position_symbol = self.SYMBOL_FLAT
-        self.entry_price = 0.0
-        self.unrealized_pnl = 0.0
-        self.steps_in_trade = 0
-        self.max_favorable_excursion = 0.0
-        self.current_drawdown = 0.0
-
-        self.initial_equity = 1.0
-        self.equity = 1.0
-        self.realized_pnl = 0.0
-        self.prev_total_pnl = 0.0
-
-    @staticmethod
-    def observation_columns() -> list[str]:
-        return [
-            "pred_ret_5",
-            "pred_ret_15",
-            "pred_ret_30",
-            "breakout_prob",
-            "continuation_prob",
-            "signal_confidence",
-            "momentum_score",
-            "momentum_dispersion",
-            "momentum_agreement",
-            "price_vs_sma20",
-            "tema20_slope",
-            "adx",
-            "atr_pct",
-            "atr_expansion",
-            "mfi_14",
-            "bop",
-            "obv_slope",
-            "donchian_breakout",
-            "donchian_breakdown",
-            "donchian_width",
-            "donchian_distance_up",
-            "donchian_distance_down",
-            "regime_conf",
-            "bull_score",
-            "bear_score",
-            "transition_score",
-            "is_opening_window",
-            "is_midday",
-            "is_power_hour",
-            "hour",
-            "minute",
-            "sma_20",
-            "sma_50",
-            "sma20_slope",
-            "bull_cross_state",
-            "bear_cross_state",
-            "cross_up_event",
-            "cross_down_event",
-        ]
+        # Must match the improved training env defaults.
+        self.env_config = TradeCentricMDPConfig(
+            initial_cash=100_000.0,
+            hmax=100,
+            transaction_cost_pct=0.001,
+            invalid_action_penalty=0.001,
+            turbulence_threshold_quantile=0.99,
+            max_episode_steps=256,
+            allow_fractional_clip_to_cash=True,
+            reward_scale=1.0,
+            min_feature_lookback=30,
+            target_num_stocks=29,
+            hold_winner_bonus_weight=0.20,
+            strong_trend_adx_threshold=20.0,
+            strong_trend_macd_floor=0.0,
+            loser_hold_penalty_weight=0.15,
+            loser_hold_threshold=0.005,
+            stagnation_penalty_weight=0.002,
+            stagnation_threshold=0.002,
+            stagnation_bars_threshold=8,
+            small_exit_penalty=0.005,
+            small_exit_threshold=0.0075,
+            premature_exit_penalty_weight=0.75,
+            premature_exit_lookahead=5,
+            premature_exit_min_future_gain=0.0075,
+            trade_reward_weight=1.00,
+            positive_trade_exponent=1.25,
+            negative_trade_linear_weight=1.25,
+            mfe_capture_bonus_weight=0.90,
+            min_bars_for_capture_bonus=3,
+            no_position_cash_idle_penalty=0.0,
+        )
 
     def build_features(self, df: pd.DataFrame) -> pd.DataFrame:
         built, _ = build_features(df, regime_engine=self.regime_engine, fit_regime_engine=False)
         return built
 
+    def _make_dummy_env(self, feat: pd.DataFrame) -> TradingEnv:
+        return TradingEnv(
+            data=feat.head(min(len(feat), 500)).copy(),
+            config=self.env_config,
+        )
+
     def _load_vec_norm(self, feat: pd.DataFrame) -> None:
         if self.vec_norm is not None:
             return
 
-        dummy_env = DummyVecEnv([lambda: TradingEnv(feat.head(500).copy())])
+        dummy_env = DummyVecEnv([lambda: self._make_dummy_env(feat)])
 
         if not self.vec_norm_path.exists():
             print(f"[live] VecNormalize file not found: {self.vec_norm_path}")
@@ -600,289 +585,62 @@ class LiveTrader:
             self.vec_norm.training = False
             self.vec_norm.norm_reward = False
             print("[live] loaded VecNormalize successfully.")
-        except AssertionError as e:
-            print(f"[live] VecNormalize shape mismatch: {e}")
+        except Exception as e:
+            print(f"[live] VecNormalize load mismatch: {e}")
             print("[live] running without saved VecNormalize.")
             self.vec_norm = None
 
-    def _get_price(self, row: pd.Series) -> float:
-        if self.position_symbol == self.SYMBOL_TQQQ:
-            return float(row["tqqq_close"])
-        if self.position_symbol == self.SYMBOL_SQQQ:
-            return float(row["sqqq_close"])
-        return float(row["qqq_close"])
-
-    def _entry_price(self, row: pd.Series, symbol: int) -> float:
-        if symbol == self.SYMBOL_TQQQ:
-            return float(row["tqqq_close"])
-        if symbol == self.SYMBOL_SQQQ:
-            return float(row["sqqq_close"])
-        raise ValueError(f"Unsupported symbol code: {symbol}")
-
-    def _reset_position_only(self) -> None:
-        self.position_symbol = self.SYMBOL_FLAT
-        self.entry_price = 0.0
-        self.unrealized_pnl = 0.0
-        self.steps_in_trade = 0
-        self.max_favorable_excursion = 0.0
-        self.current_drawdown = 0.0
-
-    def _reset_portfolio(self) -> None:
-        self._reset_position_only()
-        self.equity = self.initial_equity
-        self.realized_pnl = 0.0
-        self.prev_total_pnl = 0.0
-
-    def _is_flat(self) -> bool:
-        return self.position_symbol == self.SYMBOL_FLAT
-
-    def _is_tqqq(self) -> bool:
-        return self.position_symbol == self.SYMBOL_TQQQ
-
-    def _is_sqqq(self) -> bool:
-        return self.position_symbol == self.SYMBOL_SQQQ
-
-    def _bull_signal_ok(self, row: pd.Series) -> bool:
-        return bool(
-            float(row["bull_score"]) >= 0.60
-            and float(row["signal_confidence"]) >= 0.55
-            and float(row["price_vs_sma20"]) > 0.0
-            and float(row["sma20_slope"]) > 0.0
-            and float(row["bull_cross_state"]) > 0.5
-        )
-
-    def _bear_signal_ok(self, row: pd.Series) -> bool:
-        return bool(
-            float(row["bear_score"]) >= 0.60
-            and float(row["signal_confidence"]) >= 0.55
-            and float(row["price_vs_sma20"]) < 0.0
-            and float(row["sma20_slope"]) < 0.0
-            and float(row["bear_cross_state"]) > 0.5
-        )
-
-    def _transition_allows_tqqq(self, row: pd.Series) -> bool:
-        return bool(
-            float(row["regime_conf"]) >= self.transition_entry_confidence
-            and float(row["bull_score"]) > float(row["bear_score"])
-            and self._bull_signal_ok(row)
-        )
-
-    def _transition_allows_sqqq(self, row: pd.Series) -> bool:
-        return bool(
-            float(row["regime_conf"]) >= self.transition_entry_confidence
-            and float(row["bear_score"]) > float(row["bull_score"])
-            and self._bear_signal_ok(row)
-        )
-
-    def get_obs(self, row: pd.Series) -> np.ndarray:
-        base = [float(row[c]) for c in self.observation_columns()]
-        controlled = [
-            float(self.position_symbol == self.SYMBOL_TQQQ),
-            float(self.position_symbol == self.SYMBOL_SQQQ),
-            float(self.unrealized_pnl),
-            float(self.steps_in_trade),
-            float(self.current_drawdown),
-        ]
-        return np.asarray(base + controlled, dtype=np.float32)
-
-    def select_action(self, obs: np.ndarray) -> int:
-        if self.vec_norm is not None:
-            obs_in = self.vec_norm.normalize_obs(obs.reshape(1, -1))
-        else:
-            obs_in = obs.reshape(1, -1)
-
-        action, _ = self.model.predict(obs_in, deterministic=True)
-        return int(np.asarray(action).item())
-
-    def update_position_state(self, row: pd.Series) -> None:
-        price = self._get_price(row)
-
-        if self.position_symbol != self.SYMBOL_FLAT:
-            pnl = (price - self.entry_price) / max(self.entry_price, 1e-8)
-        else:
-            pnl = 0.0
-
-        self.unrealized_pnl = pnl
-
-        if self.position_symbol != self.SYMBOL_FLAT:
-            self.steps_in_trade += 1
-            self.max_favorable_excursion = max(self.max_favorable_excursion, pnl)
-            self.current_drawdown = self.max_favorable_excursion - pnl
-
-    def update_equity(self) -> None:
-        total_pnl = self.realized_pnl + self.unrealized_pnl
-        pnl_delta = total_pnl - self.prev_total_pnl
-        self.equity += pnl_delta
-        self.prev_total_pnl = total_pnl
-
-    def _forced_regime_action(self, row: pd.Series) -> str | None:
-        regime = str(row["regime"])
-
-        if self._is_tqqq() and regime == "BEAR":
-            exit_pnl = self.unrealized_pnl
-            self.realized_pnl += exit_pnl
-            print(
-                f"FORCED_EXIT_TQQQ @ {float(row['tqqq_close']):.2f} | "
-                f"qqq={float(row['qqq_close']):.2f} | regime={regime} | "
-                f"trade_pnl={exit_pnl:.4f}"
-            )
-            self._reset_position_only()
-            return "FORCED_EXIT_TQQQ"
-
-        if self._is_sqqq() and regime == "BULL":
-            exit_pnl = self.unrealized_pnl
-            self.realized_pnl += exit_pnl
-            print(
-                f"FORCED_EXIT_SQQQ @ {float(row['sqqq_close']):.2f} | "
-                f"qqq={float(row['qqq_close']):.2f} | regime={regime} | "
-                f"trade_pnl={exit_pnl:.4f}"
-            )
-            self._reset_position_only()
-            return "FORCED_EXIT_SQQQ"
-
-        return None
-
-    def execute_action(self, action: int, row: pd.Series) -> str:
-        """
-        Returns a human-readable action label for logging/plotting.
-        Opposite-side holdings are liquidated on hard regime flips.
-        Transition entries are limited by regime confidence.
-        """
-        forced = self._forced_regime_action(row)
-        if forced is not None:
-            return forced
-
-        regime = str(row["regime"])
-
-        if self._is_flat():
-            if action == 1:
-                if regime == "BULL" and self._bull_signal_ok(row):
-                    self.position_symbol = self.SYMBOL_TQQQ
-                    self.entry_price = self._entry_price(row, self.SYMBOL_TQQQ)
-                    self.unrealized_pnl = 0.0
-                    self.steps_in_trade = 0
-                    self.max_favorable_excursion = 0.0
-                    self.current_drawdown = 0.0
-                    print(
-                        f"ENTER_TQQQ @ {float(row['tqqq_close']):.2f} | "
-                        f"qqq={float(row['qqq_close']):.2f} | regime={regime} | "
-                        f"conf={float(row['regime_conf']):.2f}"
-                    )
-                    return "ENTER_TQQQ"
-
-                if regime == "TRANSITION" and self._transition_allows_tqqq(row):
-                    self.position_symbol = self.SYMBOL_TQQQ
-                    self.entry_price = self._entry_price(row, self.SYMBOL_TQQQ)
-                    self.unrealized_pnl = 0.0
-                    self.steps_in_trade = 0
-                    self.max_favorable_excursion = 0.0
-                    self.current_drawdown = 0.0
-                    print(
-                        f"ENTER_TQQQ_TRANSITION @ {float(row['tqqq_close']):.2f} | "
-                        f"qqq={float(row['qqq_close']):.2f} | regime={regime} | "
-                        f"conf={float(row['regime_conf']):.2f}"
-                    )
-                    return "ENTER_TQQQ_TRANSITION"
-
-            if action == 3:
-                if regime == "BEAR" and self._bear_signal_ok(row):
-                    self.position_symbol = self.SYMBOL_SQQQ
-                    self.entry_price = self._entry_price(row, self.SYMBOL_SQQQ)
-                    self.unrealized_pnl = 0.0
-                    self.steps_in_trade = 0
-                    self.max_favorable_excursion = 0.0
-                    self.current_drawdown = 0.0
-                    print(
-                        f"ENTER_SQQQ @ {float(row['sqqq_close']):.2f} | "
-                        f"qqq={float(row['qqq_close']):.2f} | regime={regime} | "
-                        f"conf={float(row['regime_conf']):.2f}"
-                    )
-                    return "ENTER_SQQQ"
-
-                if regime == "TRANSITION" and self._transition_allows_sqqq(row):
-                    self.position_symbol = self.SYMBOL_SQQQ
-                    self.entry_price = self._entry_price(row, self.SYMBOL_SQQQ)
-                    self.unrealized_pnl = 0.0
-                    self.steps_in_trade = 0
-                    self.max_favorable_excursion = 0.0
-                    self.current_drawdown = 0.0
-                    print(
-                        f"ENTER_SQQQ_TRANSITION @ {float(row['sqqq_close']):.2f} | "
-                        f"qqq={float(row['qqq_close']):.2f} | regime={regime} | "
-                        f"conf={float(row['regime_conf']):.2f}"
-                    )
-                    return "ENTER_SQQQ_TRANSITION"
-
-        if action == 2 and self._is_tqqq():
-            exit_pnl = self.unrealized_pnl
-            self.realized_pnl += exit_pnl
-            print(
-                f"EXIT_TQQQ @ {float(row['tqqq_close']):.2f} | "
-                f"qqq={float(row['qqq_close']):.2f} | regime={regime} | "
-                f"trade_pnl={exit_pnl:.4f}"
-            )
-            self._reset_position_only()
-            return "EXIT_TQQQ"
-
-        if action == 4 and self._is_sqqq():
-            exit_pnl = self.unrealized_pnl
-            self.realized_pnl += exit_pnl
-            print(
-                f"EXIT_SQQQ @ {float(row['sqqq_close']):.2f} | "
-                f"qqq={float(row['qqq_close']):.2f} | regime={regime} | "
-                f"trade_pnl={exit_pnl:.4f}"
-            )
-            self._reset_position_only()
-            return "EXIT_SQQQ"
-
-        return "HOLD"
-
-    def run(self, df: pd.DataFrame) -> None:
+    def run(self, df: pd.DataFrame) -> pd.DataFrame:
         feat = self.build_features(df)
         self._load_vec_norm(feat)
-        self._reset_portfolio()
+
+        env = TradingEnv(data=feat.copy(), config=self.env_config)
+        obs, reset_info = env.reset()
 
         print(f"[live] rows={len(feat):,}")
+        print(f"[live] tradable symbols={len(reset_info.get('stock_symbols', []))}")
         print("[live] starting replay...")
 
         records: list[dict[str, object]] = []
+        done = False
+        truncated = False
+        step_idx = 0
 
-        for i, row in feat.iterrows():
-            if i < 3:
+        while not (done or truncated):
+            if step_idx < 3:
+                row = feat.iloc[env.idx]
                 print(
-                    f"[live] sample {i} | ts={row['timestamp']} | "
+                    f"[live] sample {step_idx} | ts={row['timestamp']} | "
                     f"qqq={float(row['qqq_close']):.2f} | regime={row['regime']} | "
                     f"regime_conf={float(row['regime_conf']):.2f}"
                 )
 
-            self.update_position_state(row)
-            obs = self.get_obs(row)
-            action = self.select_action(obs)
-            action_label = self.execute_action(action, row)
+            if self.vec_norm is not None:
+                obs_in = self.vec_norm.normalize_obs(obs.reshape(1, -1))
+            else:
+                obs_in = obs.reshape(1, -1)
 
-            # Recompute after potential entry/exit/forced liquidation
-            self.update_position_state(row)
-            self.update_equity()
+            action, _ = self.model.predict(obs_in, deterministic=True)
+            action = np.asarray(action).reshape(-1)
+
+            obs, reward, done, truncated, info = env.step(action)
 
             records.append(
                 {
-                    "timestamp": row["timestamp"],
-                    "qqq_close": float(row["qqq_close"]),
-                    "tqqq_close": float(row["tqqq_close"]),
-                    "sqqq_close": float(row["sqqq_close"]),
-                    "action": int(action),
-                    "action_label": action_label,
-                    "position_symbol": int(self.position_symbol),
-                    "unrealized_pnl": float(self.unrealized_pnl),
-                    "realized_pnl": float(self.realized_pnl),
-                    "equity": float(self.equity),
-                    "regime": str(row["regime"]),
-                    "regime_conf": float(row["regime_conf"]),
-                    "signal_confidence": float(row["signal_confidence"]),
-                    "bull_score": float(row["bull_score"]),
-                    "bear_score": float(row["bear_score"]),
+                    "timestamp": feat.iloc[env.idx]["timestamp"] if env.idx < len(feat) else step_idx,
+                    "portfolio_value": float(info["portfolio_value"]),
+                    "balance": float(info["balance"]),
+                    "step_portfolio_change": float(info["step_portfolio_change"]),
+                    "reward": float(reward),
+                    "turbulence": float(info["turbulence"]),
+                    "turbulence_threshold": float(info["turbulence_threshold"]),
+                    "stock_symbols": ",".join(info["stock_symbols"]),
+                    "holdings_json": pd.Series(info["holdings"], index=info["stock_symbols"]).to_json(),
+                    "prices_json": pd.Series(info["prices"], index=info["stock_symbols"]).to_json(),
+                    "action_json": pd.Series(action, index=info["stock_symbols"]).to_json(),
                 }
             )
+            step_idx += 1
 
         print(f"[live] replay finished | records={len(records)}")
 
@@ -891,22 +649,13 @@ class LiveTrader:
         print(f"[live] results columns: {list(results.columns)}")
 
         self.plot_results(results)
+        return results
 
     def plot_results(self, results: pd.DataFrame) -> None:
         import matplotlib.pyplot as plt
 
-        if results is None:
-            print("[live] results is None.")
-            return
-
-        if results.empty:
+        if results is None or results.empty:
             print("[live] no results to plot.")
-            return
-
-        required_cols = ["timestamp", "qqq_close", "action_label", "equity"]
-        missing = [col for col in required_cols if col not in results.columns]
-        if missing:
-            print(f"[live] results missing required columns: {missing}")
             return
 
         results = results.copy()
@@ -914,118 +663,41 @@ class LiveTrader:
         results = results.dropna(subset=["timestamp"]).reset_index(drop=True)
 
         if results.empty:
-            print("[live] results became empty after timestamp parsing.")
+            print("[live] no valid timestamped results to plot.")
             return
 
-        for col in ["qqq_close", "tqqq_close", "sqqq_close", "equity"]:
+        for col in ["portfolio_value", "balance", "step_portfolio_change", "reward", "turbulence"]:
             if col in results.columns:
                 results[col] = pd.to_numeric(results[col], errors="coerce")
 
-        results = results.dropna(subset=["qqq_close", "equity"]).reset_index(drop=True)
+        results = results.dropna(subset=["portfolio_value"]).reset_index(drop=True)
         if results.empty:
-            print("[live] no valid data to plot.")
+            print("[live] no valid portfolio values to plot.")
             return
 
-        initial_equity = self.initial_equity
-        results["strategy_equity"] = results["equity"]
-
-        qqq_start = float(results["qqq_close"].iloc[0])
-        results["qqq_equity"] = initial_equity * (results["qqq_close"] / max(qqq_start, 1e-8))
-
-        # Normalized strategy equity for overlay on QQQ price panel
-        strategy_start = float(results["strategy_equity"].iloc[0])
-        results["strategy_equity_norm"] = results["strategy_equity"] / max(strategy_start, 1e-8)
-
-        tqqq_buy_idx = results["action_label"].isin(["ENTER_TQQQ", "ENTER_TQQQ_TRANSITION"])
-        tqqq_sell_idx = results["action_label"].isin(["EXIT_TQQQ", "FORCED_EXIT_TQQQ"])
-        sqqq_buy_idx = results["action_label"].isin(["ENTER_SQQQ", "ENTER_SQQQ_TRANSITION"])
-        sqqq_sell_idx = results["action_label"].isin(["EXIT_SQQQ", "FORCED_EXIT_SQQQ"])
+        import matplotlib.pyplot as plt
 
         fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
 
-        # -------------------------------------------------
-        # Top: QQQ price + normalized strategy equity overlay
-        # -------------------------------------------------
-        ax_price = axes[0]
-        ax_price.plot(
-            results["timestamp"],
-            results["qqq_close"],
-            linewidth=1.5,
-            label="QQQ Price",
-        )
-        ax_price.set_title("QQQ Price Action with Simulated Equity Overlay")
-        ax_price.grid(alpha=0.3)
+        axes[0].plot(results["timestamp"], results["portfolio_value"], linewidth=2, label="Portfolio Value")
+        axes[0].set_title("Trade-Centric Multi-Stock Portfolio Value")
+        axes[0].legend(loc="upper left")
+        axes[0].grid(alpha=0.3)
 
-        ax_equity_overlay = ax_price.twinx()
-        ax_equity_overlay.plot(
-            results["timestamp"],
-            results["strategy_equity_norm"],
-            linewidth=1.5,
-            alpha=0.85,
-            label="Strategy Equity (normalized)",
-        )
-
-        price_lines, price_labels = ax_price.get_legend_handles_labels()
-        eq_lines, eq_labels = ax_equity_overlay.get_legend_handles_labels()
-        ax_price.legend(price_lines + eq_lines, price_labels + eq_labels, loc="upper left")
-
-        # -------------------------------------------------
-        # Middle: Strategy equity vs QQQ equity
-        # -------------------------------------------------
-        axes[1].plot(
-            results["timestamp"],
-            results["strategy_equity"],
-            linewidth=2,
-            label="Strategy Equity",
-        )
-        axes[1].plot(
-            results["timestamp"],
-            results["qqq_equity"],
-            linewidth=2,
-            label="QQQ Equity",
-        )
-        axes[1].set_title("Simulated Strategy Equity vs QQQ Equity")
+        axes[1].plot(results["timestamp"], results["balance"], linewidth=1.5, label="Cash Balance")
+        axes[1].set_title("Cash Balance")
         axes[1].legend(loc="upper left")
         axes[1].grid(alpha=0.3)
 
-        # -------------------------------------------------
-        # Bottom: Trade actions over QQQ
-        # -------------------------------------------------
-        axes[2].plot(
-            results["timestamp"],
-            results["qqq_close"],
-            linewidth=1.0,
-            alpha=0.55,
-            label="QQQ Price",
-        )
-
-        axes[2].scatter(
-            results.loc[tqqq_buy_idx, "timestamp"],
-            results.loc[tqqq_buy_idx, "qqq_close"],
-            s=20,
-            label="TQQQ Entry",
-        )
-        axes[2].scatter(
-            results.loc[tqqq_sell_idx, "timestamp"],
-            results.loc[tqqq_sell_idx, "qqq_close"],
-            s=20,
-            label="TQQQ Exit",
-        )
-        axes[2].scatter(
-            results.loc[sqqq_buy_idx, "timestamp"],
-            results.loc[sqqq_buy_idx, "qqq_close"],
-            s=20,
-            label="SQQQ Entry",
-        )
-        axes[2].scatter(
-            results.loc[sqqq_sell_idx, "timestamp"],
-            results.loc[sqqq_sell_idx, "qqq_close"],
-            s=20,
-            label="SQQQ Exit",
-        )
-
-        axes[2].set_title("Trade Actions on QQQ Price")
-        axes[2].legend(loc="upper left", ncol=2)
+        axes[2].plot(results["timestamp"], results["turbulence"], linewidth=1.25, label="Turbulence")
+        if "turbulence_threshold" in results.columns and results["turbulence_threshold"].notna().any():
+            axes[2].axhline(
+                y=float(results["turbulence_threshold"].dropna().iloc[0]),
+                linestyle="--",
+                label="Turbulence Threshold",
+            )
+        axes[2].set_title("Turbulence Monitor")
+        axes[2].legend(loc="upper left")
         axes[2].grid(alpha=0.3)
 
         plt.tight_layout()

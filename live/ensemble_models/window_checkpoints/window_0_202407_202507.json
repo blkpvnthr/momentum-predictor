@@ -1,0 +1,55 @@
+{
+  "run_name": "window_0_202407_202507",
+  "agents": {
+    "ppo": {
+      "agent": "ppo",
+      "sharpe": -10.949384427634367,
+      "model_path": "/Users/blkpvnthr/Desktop/momentum-predictor/live/ensemble_models/window_0_202407_202507_ppo.zip",
+      "vecnorm_path": "/Users/blkpvnthr/Desktop/momentum-predictor/live/ensemble_models/window_0_202407_202507_ppo_vecnorm.pkl",
+      "validation_curve_path": "/Users/blkpvnthr/Desktop/momentum-predictor/live/ensemble_models/validation_curves/window_0_202407_202507_ppo_validation_curve.csv",
+      "validation_rows": 2542,
+      "final_portfolio_value": 69962.18164801362,
+      "turbulence_event_count": 26,
+      "turbulence_event_ratio": 0.010228166797797011,
+      "max_turbulence": 5627.075656396457,
+      "threshold": 594.5058996954815
+    },
+    "a2c": {
+      "agent": "a2c",
+      "sharpe": -12.742079917085759,
+      "model_path": "/Users/blkpvnthr/Desktop/momentum-predictor/live/ensemble_models/window_0_202407_202507_a2c.zip",
+      "vecnorm_path": "/Users/blkpvnthr/Desktop/momentum-predictor/live/ensemble_models/window_0_202407_202507_a2c_vecnorm.pkl",
+      "validation_curve_path": "/Users/blkpvnthr/Desktop/momentum-predictor/live/ensemble_models/validation_curves/window_0_202407_202507_a2c_validation_curve.csv",
+      "validation_rows": 2542,
+      "final_portfolio_value": 71996.20270479978,
+      "turbulence_event_count": 26,
+      "turbulence_event_ratio": 0.010228166797797011,
+      "max_turbulence": 5627.075656396457,
+      "threshold": 594.5058996954815
+    },
+    "ddpg": {
+      "agent": "ddpg",
+      "sharpe": -20.007873297198316,
+      "model_path": "/Users/blkpvnthr/Desktop/momentum-predictor/live/ensemble_models/window_0_202407_202507_ddpg.zip",
+      "vecnorm_path": "/Users/blkpvnthr/Desktop/momentum-predictor/live/ensemble_models/window_0_202407_202507_ddpg_vecnorm.pkl",
+      "validation_curve_path": "/Users/blkpvnthr/Desktop/momentum-predictor/live/ensemble_models/validation_curves/window_0_202407_202507_ddpg_validation_curve.csv",
+      "validation_rows": 2542,
+      "final_portfolio_value": 58904.13846560724,
+      "turbulence_event_count": 26,
+      "turbulence_event_ratio": 0.010228166797797011,
+      "max_turbulence": 5627.075656396457,
+      "threshold": 594.5058996954815
+    }
+  },
+  "selected_best": "ppo",
+  "trade_done": true,
+  "trade_curve_path": "/Users/blkpvnthr/Desktop/momentum-predictor/live/ensemble_models/validation_curves/window_0_202407_202507_ppo_trade_curve.csv",
+  "trade_sharpe": 6.98641419331041,
+  "trade_final_value": 127320.72830783945,
+  "trade_turbulence": {
+    "turbulence_event_count": 31,
+    "turbulence_event_ratio": 0.010388739946380697,
+    "max_turbulence": 10939.649732418417,
+    "threshold": 761.0798873727357
+  }
+}
