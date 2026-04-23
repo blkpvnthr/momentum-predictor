@@ -222,9 +222,8 @@ Machine learning
 Portfolio theory
 Real-world execution constraints
 
-> ### Goal:
-
-> Maximize return while maintaining strict control over risk and capital deployment.
+### Goal:
+Maximize return while maintaining strict control over risk and capital deployment.
 
 ⚠️ Disclaimer
 
