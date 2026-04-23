@@ -225,7 +225,7 @@ Real-world execution constraints
 ### Goal:
 Maximize return while maintaining strict control over risk and capital deployment.
 
-⚠️ Disclaimer
+# ⚠️ Disclaimer
 
 This software is for research and educational purposes only.
 Not financial advice. Use at your own risk.
