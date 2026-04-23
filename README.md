@@ -174,17 +174,17 @@ APCA_API_SECRET_KEY=your_secret
 ```bash
 python trade.py
 ```
-🔁 Execution Loop
+## 🔁 Execution Loop
 
 Every ~30 seconds:
 
-Fetch market data
-Build features
-Run RL model
-Generate target weights
-Optimize portfolio
-Execute trades
-Log results
+- Fetch market data
+- Build features
+- Run RL model
+- Generate target weights
+- Optimize portfolio
+- Execute trades
+- Log results
 
 Model signal drives decisions. Risk only constrains.
 
@@ -192,25 +192,27 @@ Execution is the Edge
 
 Most systems fail here — this one prioritizes:
 
-capital efficiency
-minimal churn
-controlled risk
-Regime Awareness
+- capital efficiency
+- minimal churn
+- controlled risk
+- Regime Awareness
 
 Same signal behaves differently across market conditions.
 
-⚠️ Limitations
-Alpaca symbol limits (~30 streams)
-Market hours only
-Requires sufficient historical data
-Dependent on feature pipeline quality
-🔮 Future Improvements
-Multi-agent ensemble strategies
-Live trading deployment
-Adaptive universe selection
-Cross-asset support (crypto, futures)
-Online learning
-📬 Summary
+## ⚠️ Limitations
+- Alpaca symbol limits (~30 streams)
+- Market hours only
+- Requires sufficient historical data
+- Dependent on feature pipeline quality
+
+## 🔮 Future Improvements
+- Multi-agent ensemble strategies
+- Live trading deployment
+- Adaptive universe selection
+- Cross-asset support (crypto, futures)
+- Online learning
+
+## 📬 Summary
 
 This is a full-stack trading system, not just a model.
 
@@ -220,9 +222,9 @@ Machine learning
 Portfolio theory
 Real-world execution constraints
 
-Goal:
+> ### Goal:
 
-Maximize return while maintaining strict control over risk and capital deployment.
+> Maximize return while maintaining strict control over risk and capital deployment.
 
 ⚠️ Disclaimer
 
