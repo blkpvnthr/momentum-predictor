@@ -185,8 +185,6 @@ Generate target weights
 Optimize portfolio
 Execute trades
 Log results
-🧪 Design Philosophy
-Alpha > Everything
 
 Model signal drives decisions. Risk only constrains.
 
