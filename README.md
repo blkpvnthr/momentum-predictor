@@ -161,7 +161,7 @@ live/logs/paper_trader_equity_curve.csv
 
 ### 1. Install Dependencies
 ```bash
-pip install -r requirements.txt
+pip install -r file.txt
 ```
 2. Configure Environment
 
