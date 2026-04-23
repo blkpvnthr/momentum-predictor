@@ -1,0 +1,22 @@
+{
+  "core_symbols": [
+    "IREN",
+    "SMCI",
+    "SOFI",
+    "TTD"
+  ],
+  "objective_value": -1.0950512162611687,
+  "solve_mode_used": "qaoa",
+  "metadata": {
+    "preferred_solver": "qaoa",
+    "allow_fallback": true,
+    "candidate_count": 10,
+    "core_size": 4,
+    "final_universe_size": 30,
+    "lambda_diversity": 0.65,
+    "gamma_cardinality": 10.0,
+    "qaoa_reps": 1,
+    "qaoa_maxiter": 20,
+    "qiskit_import_error": null
+  }
+}

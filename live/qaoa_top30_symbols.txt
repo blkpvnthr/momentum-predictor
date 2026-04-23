@@ -1,0 +1,1 @@
+['IREN', 'SMCI', 'SOFI', 'TTD', 'CORZ', 'TSLL', 'CIFR', 'APLD', 'TSLG', 'RGTI', 'ONDS', 'TEAM', 'WULF', 'RIOT', 'ETHA', 'AAL', 'INTC', 'QYLD', 'MRNA', 'WBD', 'DKNG', 'IBIT', 'PYPL', 'HBAN', 'FITB', 'BKR', 'FISV', 'CSX', 'CMCSA', 'BND']

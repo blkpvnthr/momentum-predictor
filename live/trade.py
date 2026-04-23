@@ -20,6 +20,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.enums import OrderStatus, TimeInForce
 from alpaca.trading.requests import MarketOrderRequest
 
+from portfolio_rebalancer import AlphaPortfolioConfig, AlphaPortfolioOptimizer
 from trading_env import TradeCentricMDPConfig, TradingEnv
 from trading_system import LiveTrader
 
@@ -37,25 +38,35 @@ TIMEZONE = "America/New_York"
 BAR_TIMEFRAME = TimeFrame.Minute
 WARMUP_BARS = 500
 
-# Must align with training: 31 total *_close columns including qqq_close,
-# so the env excludes qqq_close and still has 30 tradable stocks -> obs shape 202.
 CORE_SYMBOLS = ["QQQ", "TQQQ", "SQQQ"]
 UNIVERSE_SYMBOLS = [
-    "SPY", "DIA", "IWM", "XLK", "XLF", "XLE", "XLV", "SOXX", "SMH", "ARKK", "VIXY",
-    "TQQQ", "SQQQ", "SOXL", "SOXS", "TECL", "SPXL", "SPXU", "DOG", "DXD", "SRTY", "SDOW",
-    "AMD", "IONQ", "QBTS", "RGTI", "QUBT",
-    "ASTS", "LUNR", "PLTR",
+    "SPY", "RGTI", "INTC", "XLK", "XLF", "XLE", "XLV", "SOXX", "APLD", "CIFR", "VIXY",
+    "TQQQ", "SQQQ", "SOXL", "SOXS", "TECL", "SPXL", "SPXU", "SOFI", "TTD", "SMCI", "CORZ",
+    "TSLL", "IONQ", "QBTS", "QUBT", "IBIT", "LUNR", "IREN", "TSLG"
 ]
 ALL_SYMBOLS = tuple(sorted(set(CORE_SYMBOLS + UNIVERSE_SYMBOLS)))
 
 POLL_SECONDS = 30
 MIN_BUYING_POWER = 250.0
 ORDER_WAIT_SECONDS = 20
-COOLDOWN_SECONDS = 20
+COOLDOWN_SECONDS = 8
 MIN_NOTIONAL_TO_TRADE = 100.0
-MAX_SELL_FRACTION_PER_CYCLE = 1.0
-MAX_BUY_FRACTION_PER_CYCLE = 0.35
-MAX_NEW_POSITIONS_PER_CYCLE = 3
+MIN_WEIGHT_DELTA = 0.0075
+
+# Max-return execution knobs
+TOP_CANDIDATES_FOR_ALLOCATION = 8
+TOP_CANDIDATES_FOR_NEW_BUYS = 5
+MAX_SELL_FRACTION_PER_CYCLE = 1.00
+BASE_MAX_BUY_FRACTION_PER_CYCLE = 0.90
+MAX_BUY_FRACTION_CAP = 1.00
+MAX_NEW_POSITIONS_PER_CYCLE = 8
+FULL_EXIT_WEIGHT_THRESHOLD = 0.01
+
+VOL_LOOKBACK_BARS = 30
+VOL_TARGET = 0.0015
+VOL_SCALE_MIN = 0.85
+VOL_SCALE_MAX = 1.50
+
 HEARTBEAT_SECONDS = 60
 
 
@@ -124,12 +135,24 @@ class CsvJournal:
             "regime_conf",
             "turbulence",
             "turbulence_threshold",
+            "realized_volatility",
+            "execution_scale",
+            "optimizer_expected_return_annual",
+            "optimizer_expected_vol_annual",
+            "optimizer_expected_sharpe",
+            "optimizer_weight_sum",
+            "optimizer_symbol_count",
+            "optimizer_portfolio_alpha",
+            "optimizer_gross_exposure",
+            "optimizer_per_asset_cap",
+            "optimizer_risk_aversion",
             "trade_symbol",
             "trade_side",
             "trade_qty",
             "trade_price",
             "target_weight",
             "current_weight",
+            "delta_weight",
             "action_value",
             "message",
         ]
@@ -331,6 +354,32 @@ class ProductionPaperTrader:
         self.strategy = LiveTrader()
         self.strategy.env_config = build_env_config(max_episode_steps=256)
 
+        self.optimizer = AlphaPortfolioOptimizer(
+            AlphaPortfolioConfig(
+                lookback_bars=180,
+                min_history_rows=60,
+                risk_free_rate_annual=0.04,
+                cash_buffer_weight=0.01,
+                model_weight_power=1.35,
+                recent_momentum_bars=20,
+                medium_momentum_bars=60,
+                alpha_model_weight=0.65,
+                alpha_recent_momentum_weight=0.25,
+                alpha_medium_momentum_weight=0.10,
+                base_per_asset_weight_cap=0.35,
+                max_per_asset_weight_cap=0.60,
+                base_gross_exposure=0.96,
+                max_gross_exposure=0.99,
+                top_k=5,
+                top_k_min_weight_share=0.75,
+                shrinkage=0.15,
+                turnover_penalty=0.0005,
+                temperature=0.45,
+                max_iter=3000,
+                step_size=0.08,
+            )
+        )
+
         self.last_order_time: float = 0.0
         self.last_heartbeat_time: float = 0.0
         self.last_processed_timestamp: Optional[pd.Timestamp] = None
@@ -353,6 +402,14 @@ class ProductionPaperTrader:
             return False
         hhmm = ts.hour * 100 + ts.minute
         return 930 <= hhmm <= 1600
+
+    def _broker_held_symbols(self) -> list[str]:
+        held = []
+        for pos in self.broker.get_all_open_positions():
+            symbol = str(pos.symbol) if pos.symbol is not None else ""
+            if symbol and float(pos.qty) > 0:
+                held.append(symbol)
+        return sorted(set(held))
 
     def _record_account_snapshot(self, label: str, bar_ts: pd.Timestamp | None = None) -> dict[str, float | str]:
         acct = self.broker.get_account_snapshot()
@@ -512,40 +569,246 @@ class ProductionPaperTrader:
         merged["close"] = merged["qqq_close"]
         merged["volume"] = merged["qqq_volume"]
 
-        close_cols = [c for c in merged.columns if c.endswith("_close") and c != "close"]
-        print(f"[paper] merged rows before build_features={len(merged)}")
-        print(f"[paper] merged column count={len(merged.columns)}")
-        print(f"[paper] merged close columns={len(close_cols)}")
-
         if len(merged) == 0:
             return None
 
         return merged.tail(WARMUP_BARS).reset_index(drop=True)
 
-    def _current_weights(self, stock_symbols: list[str], prices: pd.Series, equity: float) -> dict[str, float]:
+    def _current_weights(self, symbols: list[str], equity: float) -> dict[str, float]:
         positions = {p.symbol: p for p in self.broker.get_all_open_positions()}
         out: dict[str, float] = {}
-        for symbol in stock_symbols:
+        for symbol in symbols:
             pos = positions.get(symbol)
             mv = float(pos.market_value) if pos is not None else 0.0
             out[symbol] = (mv / equity) if equity > 0 else 0.0
         return out
 
-    def _target_weights_from_action(self, action: np.ndarray, stock_symbols: list[str]) -> dict[str, float]:
+    def _target_weights_from_action(
+        self,
+        action: np.ndarray,
+        stock_symbols: list[str],
+        regime: str,
+        regime_conf: float,
+        signal_confidence: float,
+    ) -> dict[str, float]:
         action = np.clip(np.asarray(action, dtype=float), -1.0, 1.0)
         positive = np.clip(action, 0.0, 1.0)
 
         if positive.sum() <= 1e-8:
             return {s: 0.0 for s in stock_symbols}
 
-        weights = positive / positive.sum()
+        regime = str(regime or "").upper()
+        regime_conf = float(np.clip(regime_conf, 0.0, 1.0))
+        signal_confidence = float(np.clip(signal_confidence, 0.0, 1.0))
+
+        if regime == "BULL":
+            power = 1.60 + 0.60 * regime_conf + 0.40 * signal_confidence
+        elif regime == "TRANSITION":
+            power = 1.25 + 0.25 * signal_confidence
+        else:
+            power = 1.05
+
+        scaled = np.power(positive, power)
+        if scaled.sum() <= 1e-8:
+            scaled = positive
+
+        weights = scaled / scaled.sum()
         return {s: float(w) for s, w in zip(stock_symbols, weights)}
+
+    def _build_price_history_for_optimizer(
+        self,
+        symbols: list[str],
+        ts: pd.Timestamp,
+        lookback_bars: int,
+    ) -> pd.DataFrame:
+        rows: list[pd.DataFrame] = []
+        for symbol in symbols:
+            df = self.live_symbol_frames.get(symbol)
+            if df is None or len(df) == 0:
+                continue
+
+            sdf = (
+                df[df["timestamp"] <= ts]
+                .tail(lookback_bars)
+                .copy()
+                .sort_values("timestamp")
+            )
+            if len(sdf) == 0:
+                continue
+
+            temp = sdf[["timestamp", "close"]].copy()
+            temp["symbol"] = symbol
+            rows.append(temp[["timestamp", "symbol", "close"]])
+
+        if not rows:
+            return pd.DataFrame(columns=["timestamp", "symbol", "close"])
+
+        out = pd.concat(rows, ignore_index=True)
+        out = out.dropna(subset=["timestamp", "symbol", "close"])
+        out = out.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+        return out
+
+    def _candidate_execution_universe(
+        self,
+        stock_symbols: list[str],
+        model_target_weights: dict[str, float],
+        held_symbols: list[str],
+    ) -> list[str]:
+        ranked_model_symbols = sorted(
+            stock_symbols,
+            key=lambda s: model_target_weights.get(s, 0.0),
+            reverse=True,
+        )
+
+        top_model_symbols = [
+            s for s in ranked_model_symbols
+            if model_target_weights.get(s, 0.0) > 0.0
+        ][:TOP_CANDIDATES_FOR_ALLOCATION]
+
+        return sorted(set(top_model_symbols) | set(held_symbols))
+
+    def _optimizer_target_weights(
+        self,
+        ts: pd.Timestamp,
+        stock_symbols: list[str],
+        action: np.ndarray,
+        equity: float,
+        regime: str,
+        regime_conf: float,
+        signal_confidence: float,
+    ) -> tuple[dict[str, float], dict[str, float], dict[str, float]]:
+        held_symbols = self._broker_held_symbols()
+
+        model_target_weights = self._target_weights_from_action(
+            action=action,
+            stock_symbols=stock_symbols,
+            regime=regime,
+            regime_conf=regime_conf,
+            signal_confidence=signal_confidence,
+        )
+
+        optimizer_universe = self._candidate_execution_universe(
+            stock_symbols=stock_symbols,
+            model_target_weights=model_target_weights,
+            held_symbols=held_symbols,
+        )
+
+        if not optimizer_universe:
+            return {}, {}, {
+                "optimizer_expected_return_annual": 0.0,
+                "optimizer_expected_vol_annual": 0.0,
+                "optimizer_expected_sharpe": 0.0,
+                "optimizer_weight_sum": 0.0,
+                "optimizer_symbol_count": 0.0,
+                "optimizer_portfolio_alpha": 0.0,
+                "optimizer_gross_exposure": 0.0,
+                "optimizer_per_asset_cap": 0.0,
+                "optimizer_risk_aversion": 0.0,
+            }
+
+        current_weights = self._current_weights(optimizer_universe, equity)
+        price_history = self._build_price_history_for_optimizer(
+            symbols=optimizer_universe,
+            ts=ts,
+            lookback_bars=self.optimizer.config.lookback_bars,
+        )
+
+        if len(price_history) == 0:
+            return model_target_weights, current_weights, {
+                "optimizer_expected_return_annual": 0.0,
+                "optimizer_expected_vol_annual": 0.0,
+                "optimizer_expected_sharpe": 0.0,
+                "optimizer_weight_sum": float(sum(model_target_weights.values())),
+                "optimizer_symbol_count": float(len(optimizer_universe)),
+                "optimizer_portfolio_alpha": 0.0,
+                "optimizer_gross_exposure": 0.0,
+                "optimizer_per_asset_cap": 0.0,
+                "optimizer_risk_aversion": 0.0,
+            }
+
+        try:
+            optimized_weights, diag = self.optimizer.optimize(
+                price_history=price_history,
+                tradable_symbols=optimizer_universe,
+                current_weights=current_weights,
+                model_target_weights=model_target_weights,
+                regime=regime,
+                regime_conf=regime_conf,
+                signal_confidence=signal_confidence,
+            )
+            return optimized_weights, current_weights, diag
+        except Exception as exc:
+            print(f"[optimizer] fallback to model weights: {exc}")
+            return model_target_weights, current_weights, {
+                "optimizer_expected_return_annual": 0.0,
+                "optimizer_expected_vol_annual": 0.0,
+                "optimizer_expected_sharpe": 0.0,
+                "optimizer_weight_sum": float(sum(model_target_weights.values())),
+                "optimizer_symbol_count": float(len(optimizer_universe)),
+                "optimizer_portfolio_alpha": 0.0,
+                "optimizer_gross_exposure": 0.0,
+                "optimizer_per_asset_cap": 0.0,
+                "optimizer_risk_aversion": 0.0,
+            }
+
+    def _estimate_market_volatility(self, ts: pd.Timestamp) -> float:
+        qqq_df = self.live_symbol_frames.get("QQQ")
+        if qqq_df is None or len(qqq_df) < (VOL_LOOKBACK_BARS + 2):
+            return 0.0
+
+        recent = (
+            qqq_df[qqq_df["timestamp"] <= ts]
+            .tail(VOL_LOOKBACK_BARS + 1)
+            .copy()
+            .sort_values("timestamp")
+        )
+        if len(recent) < 5:
+            return 0.0
+
+        returns = recent["close"].pct_change().replace([np.inf, -np.inf], np.nan).dropna()
+        if len(returns) < 5:
+            return 0.0
+
+        return float(returns.std(ddof=0))
+
+    def _volatility_execution_scale(self, realized_volatility: float, regime: str, regime_conf: float, signal_confidence: float) -> float:
+        if not np.isfinite(realized_volatility) or realized_volatility <= 0:
+            return 1.0
+
+        raw_scale = VOL_TARGET / max(realized_volatility, 1e-8)
+        regime = str(regime or "").upper()
+        regime_conf = float(np.clip(regime_conf, 0.0, 1.0))
+        signal_confidence = float(np.clip(signal_confidence, 0.0, 1.0))
+
+        # In strong bullish, high-confidence conditions, do not choke risk-taking.
+        if regime == "BULL":
+            floor = 1.0 + 0.20 * regime_conf + 0.15 * signal_confidence
+            return float(np.clip(max(raw_scale, floor), 1.0, VOL_SCALE_MAX))
+
+        if regime == "TRANSITION":
+            return float(np.clip(raw_scale, 0.90, 1.10))
+
+        return float(np.clip(raw_scale, VOL_SCALE_MIN, 1.15))
+
+    def _execution_aggressiveness(self, regime: str, regime_conf: float, signal_confidence: float) -> tuple[float, int]:
+        regime = str(regime or "").upper()
+        regime_conf = float(np.clip(regime_conf, 0.0, 1.0))
+        signal_confidence = float(np.clip(signal_confidence, 0.0, 1.0))
+
+        if regime == "BULL":
+            buy_fraction = min(MAX_BUY_FRACTION_CAP, BASE_MAX_BUY_FRACTION_PER_CYCLE + 0.10 * regime_conf + 0.10 * signal_confidence)
+            max_new = int(round(MAX_NEW_POSITIONS_PER_CYCLE + 2 * regime_conf + 2 * signal_confidence))
+            return buy_fraction, max_new
+
+        if regime == "TRANSITION":
+            return 0.70, max(3, MAX_NEW_POSITIONS_PER_CYCLE - 2)
+
+        return 0.50, max(2, MAX_NEW_POSITIONS_PER_CYCLE - 4)
 
     def _place_rebalance_orders(
         self,
         ts: pd.Timestamp,
         stock_symbols: list[str],
-        prices: pd.Series,
         action: np.ndarray,
         row: pd.Series,
     ) -> list[dict[str, object]]:
@@ -554,8 +817,33 @@ class ProductionPaperTrader:
         cash_before = float(acct_before["cash"])
         buying_power_before = float(acct_before["buying_power"])
 
-        current_weights = self._current_weights(stock_symbols, prices, equity_before)
-        target_weights = self._target_weights_from_action(action, stock_symbols)
+        regime = str(row.get("regime", ""))
+        regime_conf = float(row.get("regime_conf", 0.0))
+        signal_confidence = float(row.get("signal_confidence", 0.0))
+
+        target_weights, current_weights, optimizer_diag = self._optimizer_target_weights(
+            ts=ts,
+            stock_symbols=stock_symbols,
+            action=action,
+            equity=equity_before,
+            regime=regime,
+            regime_conf=regime_conf,
+            signal_confidence=signal_confidence,
+        )
+
+        execution_symbols = sorted(set(target_weights.keys()) | set(current_weights.keys()))
+        realized_volatility = self._estimate_market_volatility(ts)
+        execution_scale = self._volatility_execution_scale(
+            realized_volatility=realized_volatility,
+            regime=regime,
+            regime_conf=regime_conf,
+            signal_confidence=signal_confidence,
+        )
+        buy_fraction, max_new_positions = self._execution_aggressiveness(
+            regime=regime,
+            regime_conf=regime_conf,
+            signal_confidence=signal_confidence,
+        )
 
         if self._in_cooldown():
             return [{
@@ -566,43 +854,85 @@ class ProductionPaperTrader:
                 "cash_after": cash_before,
                 "buying_power_before": buying_power_before,
                 "buying_power_after": buying_power_before,
+                "realized_volatility": realized_volatility,
+                "execution_scale": execution_scale,
+                **optimizer_diag,
             }]
 
-        orders: list[dict[str, object]] = []
+        prices = {}
+        for symbol in execution_symbols:
+            df = self.live_symbol_frames.get(symbol)
+            if df is None or len(df) == 0:
+                continue
+            sdf = df[df["timestamp"] <= ts]
+            if len(sdf) == 0:
+                continue
+            prices[symbol] = float(sdf.iloc[-1]["close"])
 
+        orders: list[dict[str, object]] = []
         positions = {p.symbol: p for p in self.broker.get_all_open_positions()}
-        sell_candidates = []
-        for symbol in stock_symbols:
+
+        ranked_candidates = sorted(
+            execution_symbols,
+            key=lambda s: (target_weights.get(s, 0.0) - current_weights.get(s, 0.0), target_weights.get(s, 0.0)),
+            reverse=True,
+        )
+
+        # 1) Sell first so capital is freed immediately.
+        sell_candidates: list[tuple[str, float, float, float]] = []
+        for symbol in execution_symbols:
             price = float(prices.get(symbol, np.nan))
             if not np.isfinite(price) or price <= 0:
                 continue
-            cw = current_weights.get(symbol, 0.0)
-            tw = target_weights.get(symbol, 0.0)
+
+            cw = float(current_weights.get(symbol, 0.0))
+            tw = float(target_weights.get(symbol, 0.0))
             delta_w = tw - cw
-            if delta_w < 0 and symbol in positions:
-                sell_notional = min(abs(delta_w) * equity_before, abs(cw) * equity_before) * MAX_SELL_FRACTION_PER_CYCLE
-                if sell_notional >= MIN_NOTIONAL_TO_TRADE:
-                    sell_candidates.append((symbol, delta_w, sell_notional, price))
+
+            if symbol not in positions or abs(delta_w) < MIN_WEIGHT_DELTA:
+                continue
+
+            if tw <= FULL_EXIT_WEIGHT_THRESHOLD:
+                desired_notional = cw * equity_before
+                sell_notional = desired_notional
+            elif delta_w < 0:
+                urgency = float(np.clip(abs(delta_w) / 0.05, 0.75, 1.35))
+                desired_notional = abs(delta_w) * equity_before
+                sell_notional = desired_notional * MAX_SELL_FRACTION_PER_CYCLE * urgency
+            else:
+                continue
+
+            if sell_notional >= MIN_NOTIONAL_TO_TRADE:
+                sell_candidates.append((symbol, delta_w, sell_notional, price))
+
+        sell_candidates.sort(key=lambda x: x[1])  # most negative delta first
 
         for symbol, delta_w, notional, price in sell_candidates:
             pos = positions.get(symbol)
             if pos is None or pos.qty <= 0 or self.broker.has_open_order_for_symbol(symbol):
                 continue
+
             qty = min(int(pos.qty), int(notional // price))
+            if qty <= 0 and abs(delta_w) > 0.03:
+                qty = min(int(pos.qty), 1)
+
             if qty <= 0:
                 continue
+
             self.broker.submit_market_sell(symbol, qty)
             self.broker.wait_until_qty_at_or_below(symbol, max(0.0, float(pos.qty) - qty))
             self._mark_order()
+
             orders.append(
                 {
                     "trade_symbol": symbol,
                     "trade_side": "SELL",
                     "trade_qty": qty,
                     "trade_price": price,
-                    "target_weight": target_weights.get(symbol, 0.0),
-                    "current_weight": current_weights.get(symbol, 0.0),
-                    "action_value": float(action[stock_symbols.index(symbol)]),
+                    "target_weight": tw,
+                    "current_weight": cw,
+                    "delta_weight": delta_w,
+                    "action_value": float(action[stock_symbols.index(symbol)]) if symbol in stock_symbols else 0.0,
                     "message": "rebalance_sell",
                 }
             )
@@ -611,36 +941,54 @@ class ProductionPaperTrader:
         equity_mid = float(acct_mid["equity"])
         buying_power_mid = float(acct_mid["buying_power"])
 
+        # 2) Buy high-conviction names first.
+        new_positions_count = 0
         buy_candidates = []
-        for symbol in stock_symbols:
+        for symbol in ranked_candidates:
             price = float(prices.get(symbol, np.nan))
             if not np.isfinite(price) or price <= 0:
                 continue
-            cw = current_weights.get(symbol, 0.0)
-            tw = target_weights.get(symbol, 0.0)
-            delta_w = tw - cw
-            if delta_w > 0:
-                buy_notional = delta_w * equity_mid * MAX_BUY_FRACTION_PER_CYCLE
-                if buy_notional >= MIN_NOTIONAL_TO_TRADE:
-                    buy_candidates.append((symbol, delta_w, buy_notional, price))
 
-        buy_candidates.sort(key=lambda x: x[1], reverse=True)
-        new_positions_count = 0
-        for symbol, delta_w, notional, price in buy_candidates:
+            tw = float(target_weights.get(symbol, 0.0))
+            cw = float(current_weights.get(symbol, 0.0))
+            delta_w = tw - cw
+
+            if delta_w < MIN_WEIGHT_DELTA:
+                continue
+
+            if symbol not in positions and tw <= 0.0:
+                continue
+
+            buy_notional = delta_w * equity_mid * buy_fraction * execution_scale
+            if buy_notional >= MIN_NOTIONAL_TO_TRADE:
+                buy_candidates.append((symbol, delta_w, tw, buy_notional, price))
+
+        buy_candidates = buy_candidates[: max(TOP_CANDIDATES_FOR_NEW_BUYS, max_new_positions)]
+
+        for symbol, delta_w, tw, notional, price in buy_candidates:
             if buying_power_mid < MIN_BUYING_POWER or self.broker.has_open_order_for_symbol(symbol):
                 continue
+
             existing = self.broker.get_position(symbol)
             is_new = existing.qty <= 0
-            if is_new and new_positions_count >= MAX_NEW_POSITIONS_PER_CYCLE:
+            if is_new and new_positions_count >= max_new_positions:
                 continue
 
-            qty = int(min(notional, buying_power_mid) // price)
+            max_affordable_notional = max(0.0, buying_power_mid - MIN_BUYING_POWER)
+            if max_affordable_notional < MIN_NOTIONAL_TO_TRADE:
+                continue
+
+            qty = int(min(notional, max_affordable_notional) // price)
+            if qty <= 0 and min(notional, max_affordable_notional) >= price:
+                qty = 1
+
             if qty <= 0:
                 continue
 
             self.broker.submit_market_buy(symbol, qty)
             self.broker.wait_for_position(symbol)
             self._mark_order()
+
             buying_power_mid = max(0.0, buying_power_mid - qty * price)
             if is_new:
                 new_positions_count += 1
@@ -651,9 +999,10 @@ class ProductionPaperTrader:
                     "trade_side": "BUY",
                     "trade_qty": qty,
                     "trade_price": price,
-                    "target_weight": target_weights.get(symbol, 0.0),
+                    "target_weight": tw,
                     "current_weight": current_weights.get(symbol, 0.0),
-                    "action_value": float(action[stock_symbols.index(symbol)]),
+                    "delta_weight": delta_w,
+                    "action_value": float(action[stock_symbols.index(symbol)]) if symbol in stock_symbols else 0.0,
                     "message": "rebalance_buy",
                 }
             )
@@ -667,11 +1016,14 @@ class ProductionPaperTrader:
             o["buying_power_before"] = buying_power_before
             o["buying_power_after"] = float(acct_after["buying_power"])
             o["portfolio_value_model"] = ""
-            o["signal_confidence"] = float(row.get("signal_confidence", 0.0))
-            o["regime"] = str(row.get("regime", ""))
-            o["regime_conf"] = float(row.get("regime_conf", 0.0))
+            o["signal_confidence"] = signal_confidence
+            o["regime"] = regime
+            o["regime_conf"] = regime_conf
             o["turbulence"] = ""
             o["turbulence_threshold"] = ""
+            o["realized_volatility"] = realized_volatility
+            o["execution_scale"] = execution_scale
+            o.update(optimizer_diag)
 
         if not orders:
             orders.append(
@@ -683,6 +1035,7 @@ class ProductionPaperTrader:
                     "trade_price": 0.0,
                     "target_weight": "",
                     "current_weight": "",
+                    "delta_weight": "",
                     "action_value": "",
                     "equity_before": equity_before,
                     "equity_after": float(acct_after["equity"]),
@@ -691,11 +1044,14 @@ class ProductionPaperTrader:
                     "buying_power_before": buying_power_before,
                     "buying_power_after": float(acct_after["buying_power"]),
                     "portfolio_value_model": "",
-                    "signal_confidence": float(row.get("signal_confidence", 0.0)),
-                    "regime": str(row.get("regime", "")),
-                    "regime_conf": float(row.get("regime_conf", 0.0)),
+                    "signal_confidence": signal_confidence,
+                    "regime": regime,
+                    "regime_conf": regime_conf,
                     "turbulence": "",
                     "turbulence_threshold": "",
+                    "realized_volatility": realized_volatility,
+                    "execution_scale": execution_scale,
+                    **optimizer_diag,
                 }
             )
 
@@ -719,28 +1075,53 @@ class ProductionPaperTrader:
                     "regime_conf": order.get("regime_conf", ""),
                     "turbulence": model_info.get("turbulence", ""),
                     "turbulence_threshold": model_info.get("turbulence_threshold", ""),
+                    "realized_volatility": order.get("realized_volatility", ""),
+                    "execution_scale": order.get("execution_scale", ""),
+                    "optimizer_expected_return_annual": order.get("optimizer_expected_return_annual", ""),
+                    "optimizer_expected_vol_annual": order.get("optimizer_expected_vol_annual", ""),
+                    "optimizer_expected_sharpe": order.get("optimizer_expected_sharpe", ""),
+                    "optimizer_weight_sum": order.get("optimizer_weight_sum", ""),
+                    "optimizer_symbol_count": order.get("optimizer_symbol_count", ""),
+                    "optimizer_portfolio_alpha": order.get("optimizer_portfolio_alpha", ""),
+                    "optimizer_gross_exposure": order.get("optimizer_gross_exposure", ""),
+                    "optimizer_per_asset_cap": order.get("optimizer_per_asset_cap", ""),
+                    "optimizer_risk_aversion": order.get("optimizer_risk_aversion", ""),
                     "trade_symbol": order.get("trade_symbol", ""),
                     "trade_side": order.get("trade_side", ""),
                     "trade_qty": order.get("trade_qty", ""),
                     "trade_price": order.get("trade_price", ""),
                     "target_weight": order.get("target_weight", ""),
                     "current_weight": order.get("current_weight", ""),
+                    "delta_weight": order.get("delta_weight", ""),
                     "action_value": order.get("action_value", ""),
                     "message": order.get("message", ""),
                 }
             )
 
-    def _print_heartbeat(self, latest_ts: pd.Timestamp, stock_symbols: list[str], portfolio_value_model: float) -> None:
+    def _print_heartbeat(
+        self,
+        latest_ts: pd.Timestamp,
+        stock_symbols: list[str],
+        portfolio_value_model: float,
+        realized_volatility: float = 0.0,
+        execution_scale: float = 1.0,
+        optimizer_diag: Optional[dict[str, float]] = None,
+    ) -> None:
         now_ts = time.time()
         if (now_ts - self.last_heartbeat_time) < HEARTBEAT_SECONDS:
             return
 
+        optimizer_diag = optimizer_diag or {}
         equity_text = "n/a" if self.last_equity is None else f"${self.last_equity:,.2f}"
         print(
             f"[paper] heartbeat | latest_ts={latest_ts} | "
             f"tracked_symbols={len(stock_symbols)} | "
             f"broker_equity={equity_text} | "
-            f"model_portfolio_value={portfolio_value_model:.2f}"
+            f"model_portfolio_value={portfolio_value_model:.2f} | "
+            f"realized_vol={realized_volatility:.6f} | "
+            f"exec_scale={execution_scale:.3f} | "
+            f"opt_alpha={float(optimizer_diag.get('optimizer_portfolio_alpha', 0.0)):.4f} | "
+            f"opt_sharpe={float(optimizer_diag.get('optimizer_expected_sharpe', 0.0)):.4f}"
         )
         self.last_heartbeat_time = now_ts
 
@@ -754,23 +1135,13 @@ class ProductionPaperTrader:
             return
 
         feat = self.strategy.build_features(merged)
-        print(f"[paper] feature rows after build_features={len(feat)}")
         self.strategy._load_vec_norm(feat)
         if len(feat) == 0:
             print("[paper] no feature rows available after live merge")
             return
 
-        close_cols = [c for c in feat.columns if c.endswith("_close") and c != "close"]
-        tradable_close_cols = [c for c in close_cols if c != "qqq_close"]
-        print(f"[debug] env target_num_stocks={self.strategy.env_config.target_num_stocks}")
-        print(f"[debug] feature close cols={len(close_cols)}")
-        print(f"[debug] tradable feature close cols={len(tradable_close_cols)}")
-
         env = TradingEnv(data=feat.copy(), config=self.strategy.env_config)
-        print(f"[debug] env obs shape={env.observation_space.shape}")
-        print(f"[debug] env discovered tradable stocks={env.num_stocks}")
-
-        obs, reset_info = env.reset()
+        obs, _reset_info = env.reset()
 
         if self.strategy.vec_norm is not None:
             obs_in = self.strategy.vec_norm.normalize_obs(obs.reshape(1, -1))
@@ -780,7 +1151,7 @@ class ProductionPaperTrader:
         action, _ = self.strategy.model.predict(obs_in, deterministic=True)
         action = np.asarray(action).reshape(-1)
 
-        _obs2, reward, done, truncated, info = env.step(action)
+        _obs2, reward, _done, _truncated, info = env.step(action)
 
         row = feat.iloc[env.idx]
         bar_ts = pd.to_datetime(row["timestamp"], errors="coerce")
@@ -793,16 +1164,44 @@ class ProductionPaperTrader:
             return
 
         stock_symbols = list(info["stock_symbols"])
-        prices = pd.Series(info["prices"], index=stock_symbols, dtype=float)
+        realized_volatility = self._estimate_market_volatility(bar_ts)
+        execution_scale = self._volatility_execution_scale(
+            realized_volatility=realized_volatility,
+            regime=str(row.get("regime", "")),
+            regime_conf=float(row.get("regime_conf", 0.0)),
+            signal_confidence=float(row.get("signal_confidence", 0.0)),
+        )
+
+        optimizer_target_weights, _, optimizer_diag = self._optimizer_target_weights(
+            ts=bar_ts,
+            stock_symbols=stock_symbols,
+            action=action,
+            equity=float(self.broker.get_account_snapshot()["equity"]),
+            regime=str(row.get("regime", "")),
+            regime_conf=float(row.get("regime_conf", 0.0)),
+            signal_confidence=float(row.get("signal_confidence", 0.0)),
+        )
+
+        top_targets = sorted(
+            optimizer_target_weights.items(),
+            key=lambda kv: kv[1],
+            reverse=True,
+        )[:5]
 
         print(
             f"[model] ts={bar_ts} | regime={row.get('regime', 'UNKNOWN')} | "
             f"regime_conf={float(row.get('regime_conf', 0.0)):.3f} | "
             f"signal_conf={float(row.get('signal_confidence', 0.0)):.3f} | "
-            f"portfolio_value={float(info['portfolio_value']):.2f} | reward={float(reward):.5f}"
+            f"portfolio_value={float(info['portfolio_value']):.2f} | "
+            f"reward={float(reward):.5f} | "
+            f"realized_vol={realized_volatility:.6f} | "
+            f"exec_scale={execution_scale:.3f} | "
+            f"opt_alpha={float(optimizer_diag.get('optimizer_portfolio_alpha', 0.0)):.4f} | "
+            f"opt_sharpe={float(optimizer_diag.get('optimizer_expected_sharpe', 0.0)):.4f} | "
+            f"top_targets={top_targets}"
         )
 
-        orders = self._place_rebalance_orders(bar_ts, stock_symbols, prices, action, row)
+        orders = self._place_rebalance_orders(bar_ts, stock_symbols, action, row)
 
         model_info = {
             "portfolio_value_model": float(info["portfolio_value"]),
@@ -813,13 +1212,26 @@ class ProductionPaperTrader:
 
         self.last_processed_timestamp = ts
         self._write_account_equity_curve()
-        self._print_heartbeat(bar_ts, stock_symbols, float(info["portfolio_value"]))
+        self._print_heartbeat(
+            bar_ts,
+            stock_symbols,
+            float(info["portfolio_value"]),
+            realized_volatility=realized_volatility,
+            execution_scale=execution_scale,
+            optimizer_diag=optimizer_diag,
+        )
 
         for order in orders:
             print(
                 f"[paper] {bar_ts} | {order.get('message','')} | "
                 f"symbol={order.get('trade_symbol','')} | side={order.get('trade_side','')} | "
-                f"qty={order.get('trade_qty','')} | price={order.get('trade_price','')}"
+                f"qty={order.get('trade_qty','')} | price={order.get('trade_price','')} | "
+                f"target_w={order.get('target_weight','')} | current_w={order.get('current_weight','')} | "
+                f"delta_w={order.get('delta_weight','')} | "
+                f"opt_alpha={order.get('optimizer_portfolio_alpha','')} | "
+                f"opt_sharpe={order.get('optimizer_expected_sharpe','')} | "
+                f"realized_vol={order.get('realized_volatility','')} | "
+                f"exec_scale={order.get('execution_scale','')}"
             )
 
     def run(self) -> None:

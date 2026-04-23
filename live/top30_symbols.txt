@@ -1,1 +1,1 @@
-['INTC', 'IBIT', 'SQQQ', 'CMCSA', 'PYPL', 'BND', 'WBD', 'CSX', 'NVD', 'MDLZ', 'SOFI', 'PLTD', 'FITB', 'IREN', 'ETHA', 'SMCI', 'TSLL', 'BKR', 'EXC', 'HBAN', 'AAL', 'TEAM', 'WULF', 'DKNG', 'TTD', 'TSLG', 'FAST', 'TSDD', 'CPRT', 'KHC']
+['INTC', 'IBIT', 'SQQQ', 'CMCSA', 'PYPL', 'WBD', 'BND', 'CSX', 'NVD', 'MDLZ', 'PLTD', 'SOFI', 'FITB', 'IREN', 'SMCI', 'ETHA', 'TSLL', 'BKR', 'EXC', 'AAL', 'HBAN', 'TEAM', 'WULF', 'TTD', 'DKNG', 'TSLG', 'TSDD', 'FAST', 'CPRT', 'KHC']

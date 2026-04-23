@@ -12,3 +12,6 @@ __pycache__/
 .env
 live/logs/
 live/__pycache__/
+live/__pycache__/*
+live/__pycache__/**
+.venv/
