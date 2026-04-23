@@ -162,14 +162,18 @@ live/logs/paper_trader_equity_curve.csv
 ### 1. Install Dependencies
 ```bash
 pip install -r requirements.txt
+```
 2. Configure Environment
 
 Create .env:
-
+```bash
 APCA_API_KEY_ID=your_key
 APCA_API_SECRET_KEY=your_secret
+```
 3. Run Paper Trader
+```bash
 python trade.py
+```
 🔁 Execution Loop
 
 Every ~30 seconds:
