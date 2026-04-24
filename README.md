@@ -30,8 +30,8 @@ It integrates:
 ## 🧠 Architecture
 
 ```
-Market Data → Feature Engineering → RL Policy → Target Weights
-↓
+Market Data → Feature Engineering → RL Policy → Target Weights ↓
+↓                            ←                               ←
 Alpha Portfolio Optimizer (Sharpe + Covariance + Momentum)
 ↓
 Execution Engine (Volatility + Regime + Capital Constraints)
